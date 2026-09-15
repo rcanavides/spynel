@@ -171,7 +171,7 @@ func runHarnessFixture(mode string) int {
 		return runClaudeFixture(mode)
 	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session", "pi-model-capabilities", "pi-off-default":
 		return runPiFixture(mode)
-	case "acp-lifecycle", "acp-interrupt", "acp-version-mismatch", "acp-session-error":
+	case "acp-lifecycle", "acp-interrupt", "acp-version-mismatch", "acp-session-error", "acp-late-final-chunk":
 		return runACPFixture(mode)
 	default:
 		_, _ = fmt.Fprintf(os.Stderr, "unknown harness fixture mode %q\n", mode)
@@ -365,6 +365,28 @@ func runACPFixture(mode string) int {
 			promptMu.Lock()
 			promptID = append(json.RawMessage(nil), request.ID...)
 			promptMu.Unlock()
+			if mode == "acp-late-final-chunk" {
+				go func(id json.RawMessage) {
+					// Reproduce an ACP provider that replies end_turn before
+					// its final assistant message update reaches the client.
+					respond(message{ID: id}, map[string]any{"stopReason": "end_turn"})
+					time.Sleep(50 * time.Millisecond)
+					write(map[string]any{
+						"jsonrpc": "2.0",
+						"method":  "session/update",
+						"params": map[string]any{
+							"sessionId": "acp-session",
+							"update": map[string]any{
+								"sessionUpdate": "agent_message_chunk",
+								"content": map[string]any{
+									"type": "text",
+									"text": "LATE_FINAL_OK",
+								},
+							},
+						},
+					})
+				}(append(json.RawMessage(nil), request.ID...))
+			}
 			if mode == "acp-lifecycle" {
 				write(map[string]any{"jsonrpc": "2.0", "id": 900, "method": "session/request_permission", "params": map[string]any{
 					"sessionId": "acp-session", "toolCall": map[string]any{"toolCallId": "tool-1", "kind": "edit"},

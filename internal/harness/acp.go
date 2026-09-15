@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/fsx"
@@ -311,6 +312,12 @@ func (a *ACP) awaitPrompt(key, sessionID string, turn *acpTurn, waiter <-chan ac
 	if result.StopReason == "cancelled" {
 		a.finishPrompt(key, sessionID, turn, result.StopReason, errors.New("ACP turn cancelled"))
 		return
+	}
+	if result.StopReason == "end_turn" {
+		// Some ACP providers can acknowledge the prompt before the final
+		// agent_message_chunk reaches the client. Keep the turn addressable
+		// for a short bounded grace period so that final text is not lost.
+		time.Sleep(100 * time.Millisecond)
 	}
 	a.finishPrompt(key, sessionID, turn, result.StopReason, nil)
 }
