@@ -56,6 +56,7 @@ type ScheduledCheckpoint struct {
 type Manager struct {
 	Config                   config.Config
 	Harness                  harness.Harness
+	HarnessRouter            harness.RoleRouter
 	Hooks                    extensions.Runner
 	Log                      func(string)
 	JobStarted               func(lease Lease, description string, firstAssignedAt time.Time, providerIterations, implementationAttempts int) (int, error)
@@ -215,7 +216,7 @@ func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Ma
 		parallel = 1
 	}
 	manager := &Manager{
-		Config: cfg, runtimeConfig: cfg, Harness: target, Hooks: hooks, inflight: map[string]bool{}, runtimeJobs: map[string]int{}, controlCancelled: map[string]int{}, capacityLimit: parallel,
+		Config: cfg, runtimeConfig: cfg, Harness: target, HarnessRouter: harness.NewStaticRoleRouter(target, nil), Hooks: hooks, inflight: map[string]bool{}, runtimeJobs: map[string]int{}, controlCancelled: map[string]int{}, capacityLimit: parallel,
 		Outbox:                 &Outbox{Directory: cfg.StatePath("runtime", "outbox")},
 		ownerID:                fmt.Sprintf("%d-%d-%s", os.Getpid(), time.Now().UTC().UnixNano(), randomSuffix()),
 		scanNow:                make(chan struct{}, 1),
@@ -796,7 +797,7 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			// Terminal provider completion remains visible as awaiting_transition
 			// until reconciliation observes the agent-authored durable file move.
 		}
-		threadID, steered, err := m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
+		threadID, steered, err := m.harnessForPhase(lease.Phase).Send(ctx, lease.SessionKey, prompt, emit)
 		lifecycleMu.Lock()
 		defer lifecycleMu.Unlock()
 		if err != nil {
@@ -1117,7 +1118,7 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		return err
 	}
 	for _, lease := range leases {
-		if lease.State != "claiming" || m.isInflight(lease.ID) || m.Harness.IsActive(lease.SessionKey) {
+		if lease.State != "claiming" || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
 		if _, err := os.Stat(lease.File); os.IsNotExist(err) && lease.SourceFile != "" {
@@ -1489,7 +1490,7 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 			continue
 		}
 		foreignOwner := lease.OwnerID != "" && lease.OwnerID != m.ownerID
-		if (!foreignOwner && now.Sub(lease.HeartbeatAt) < route.StaleAfter) || m.isInflight(lease.ID) || m.Harness.IsActive(lease.SessionKey) {
+		if (!foreignOwner && now.Sub(lease.HeartbeatAt) < route.StaleAfter) || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
 		lease.OwnerID = m.ownerID
@@ -1536,6 +1537,26 @@ func (m *Manager) renderPrompt(route workflowRoute, lease Lease, promptPath stri
 	}
 	prompt = instructions.InjectRoleScopeDiscipline(prompt, role)
 	return instructions.Append(prompt, m.Config.StatePath(), role)
+}
+
+// harnessForPhase resolves provider work by logical orchestration role.
+// Implementation and planning use the developer role; independent review
+// uses the reviewer role. The legacy Harness remains the fallback.
+func (m *Manager) harnessForPhase(phase string) harness.Harness {
+	role := harness.RoleDeveloper
+
+	switch normalizeLeasePhase("", phase) {
+	case phaseTaskReview, phaseGoalReview:
+		role = harness.RoleReviewer
+	}
+
+	if m.HarnessRouter != nil {
+		if target := m.HarnessRouter.HarnessForRole(role); target != nil {
+			return target
+		}
+	}
+
+	return m.Harness
 }
 
 func (m *Manager) harnessSettings() config.Harness {
@@ -1605,7 +1626,7 @@ func (m *Manager) WaitForIdle(ctx context.Context) error {
 		}
 		busy := false
 		for _, lease := range leases {
-			if m.Harness.IsActive(lease.SessionKey) || m.isInflight(lease.ID) {
+			if m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) || m.isInflight(lease.ID) {
 				busy = true
 				break
 			}
@@ -1769,7 +1790,7 @@ func (m *Manager) LeaseForSession(sessionKey string) (Lease, bool) {
 // by this manager. A successful gate returns the lease to processing; the
 // provider's subsequent events remain responsible for heartbeat activity.
 func (m *Manager) PrepareControlContinuation(expected Lease, expectedDocumentID string) bool {
-	if !m.ControlStillValid(expected, expectedDocumentID) || !m.Harness.IsActive(expected.SessionKey) {
+	if !m.ControlStillValid(expected, expectedDocumentID) || !m.harnessForPhase(expected.Phase).IsActive(expected.SessionKey) {
 		return false
 	}
 	current, err := m.loadLease(expected.ID)
