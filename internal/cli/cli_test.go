@@ -1740,3 +1740,179 @@ func TestStandaloneUpdateRestartAndProactiveEligibility(t *testing.T) {
 		t.Fatal("ignored check suppression")
 	}
 }
+
+func TestBuildServiceWithoutRoutingKeepsSingleHarness(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	if service.RoleHarnesses != nil {
+		t.Fatal("legacy single-harness configuration unexpectedly created routed harnesses")
+	}
+}
+
+func TestBuildServiceConstructsUniqueRoutedHarnesses(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Model = ""
+	cfg.Harness.ReasoningEffort = ""
+	cfg.Harness.ServiceMode = ""
+	cfg.Harness.Sandbox = "danger-full-access"
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer: "codex",
+		Reviewer:  "claude-code",
+		Heartbeat: "codex",
+	}
+
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	if service.RoleHarnesses == nil {
+		t.Fatal("routed configuration did not create role harness runtime")
+	}
+
+	developer := service.RoleHarnesses.HarnessForRole(harness.RoleDeveloper)
+	reviewer := service.RoleHarnesses.HarnessForRole(harness.RoleReviewer)
+	heartbeat := service.RoleHarnesses.HarnessForRole(harness.RoleHeartbeat)
+	notification := service.RoleHarnesses.HarnessForRole(harness.RoleNotification)
+
+	if developer == service.Harness {
+		t.Fatal("developer unexpectedly resolved to primary harness")
+	}
+	if reviewer == service.Harness {
+		t.Fatal("reviewer unexpectedly resolved to primary harness")
+	}
+	if developer != heartbeat {
+		t.Fatal("roles using the same provider did not share one supervisor")
+	}
+	if notification != service.Harness {
+		t.Fatal("unconfigured notification role did not fall back to primary harness")
+	}
+	if developer == reviewer {
+		t.Fatal("different routed providers unexpectedly share one supervisor")
+	}
+
+	developerConfigurable, ok := developer.(interface {
+		HarnessConfig() harness.HarnessConfig
+	})
+	if !ok {
+		t.Fatal("developer supervisor does not expose HarnessConfig")
+	}
+
+	developerConfig := developerConfigurable.HarnessConfig()
+	if developerConfig.Name != "codex" {
+		t.Fatalf("developer harness name = %q, want codex", developerConfig.Name)
+	}
+	if developerConfig.Model != "" {
+		t.Fatalf("developer inherited primary model %q", developerConfig.Model)
+	}
+	if developerConfig.Effort != "" {
+		t.Fatalf("developer inherited primary effort %q", developerConfig.Effort)
+	}
+	if developerConfig.ServiceMode != "" {
+		t.Fatalf("developer inherited primary service mode %q", developerConfig.ServiceMode)
+	}
+	if developerConfig.Sandbox != "danger-full-access" {
+		t.Fatalf("developer sandbox = %q, want shared execution policy", developerConfig.Sandbox)
+	}
+
+	reviewerConfigurable, ok := reviewer.(interface {
+		HarnessConfig() harness.HarnessConfig
+	})
+	if !ok {
+		t.Fatal("reviewer supervisor does not expose HarnessConfig")
+	}
+
+	if got := reviewerConfigurable.HarnessConfig().Name; got != "claude-code" {
+		t.Fatalf("reviewer harness name = %q, want claude-code", got)
+	}
+
+	primaryConfigurable, ok := service.Harness.(interface {
+		HarnessConfig() harness.HarnessConfig
+	})
+	if !ok {
+		t.Fatal("primary supervisor does not expose HarnessConfig")
+	}
+
+	primaryConfig := primaryConfigurable.HarnessConfig()
+	if primaryConfig.Name != "agent-zero" {
+		t.Fatalf("primary harness name = %q, want agent-zero", primaryConfig.Name)
+	}
+	if primaryConfig.Sandbox != "danger-full-access" {
+		t.Fatalf("primary sandbox = %q, want preserved value", primaryConfig.Sandbox)
+	}
+}
+
+func TestNewRoutedHarnessDoesNotInheritPrimaryInference(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A valid inference-capable primary may have explicit provider settings.
+	// A different routed provider must not inherit those values.
+	cfg.Harness.Name = "codex"
+	cfg.Harness.Model = "primary-model"
+	cfg.Harness.ReasoningEffort = "high"
+	cfg.Harness.ServiceMode = ""
+
+	runtimeState := app.NewRuntimeAt(
+		cfg.StatePath("runtime", "logs"),
+		"routed-inference-test",
+	)
+	defer runtimeState.Close()
+
+	target := newHarnessSupervisor(
+		harness.NewBuiltinRegistry(),
+		cfg,
+		"claude-code",
+		"test",
+		runtimeState,
+		false,
+	)
+	defer target.Close()
+
+	runtimeConfig := target.HarnessConfig()
+
+	if runtimeConfig.Name != "claude-code" {
+		t.Fatalf("routed harness name = %q, want claude-code", runtimeConfig.Name)
+	}
+	if runtimeConfig.Model != "" {
+		t.Fatalf("routed harness inherited primary model %q", runtimeConfig.Model)
+	}
+	if runtimeConfig.Effort != "" {
+		t.Fatalf("routed harness inherited primary effort %q", runtimeConfig.Effort)
+	}
+	if runtimeConfig.ServiceMode != "" {
+		t.Fatalf("routed harness inherited primary service mode %q", runtimeConfig.ServiceMode)
+	}
+}

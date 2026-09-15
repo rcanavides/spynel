@@ -1115,33 +1115,140 @@ func writeCLIEvent(output io.Writer, streamed *strings.Builder, event core.Event
 	return false, nil
 }
 
+func newHarnessSupervisor(
+	registry *harness.Registry,
+	cfg config.Config,
+	name string,
+	version string,
+	runtimeState *app.Runtime,
+	primary bool,
+) *harness.Supervisor {
+	customCommand := ""
+	var customArgs []string
+
+	runtimeConfig := harness.HarnessConfig{
+		Name:           name,
+		Cwd:            cfg.Root,
+		ApprovalPolicy: "never",
+		Sandbox:        cfg.Harness.Sandbox,
+		Network:        false,
+		SessionsFile:   cfg.HarnessSessionsPath(name),
+		Version:        version,
+		Stderr:         runtimeState.Writer("harness"),
+	}
+
+	// Preserve the complete historical configuration only for the primary
+	// communication/chat harness. Routed harnesses use their own provider
+	// defaults for inference properties until per-provider profiles exist.
+	if primary {
+		customCommand = cfg.Harness.ACPCommand
+		customArgs = cfg.Harness.ACPArgs
+		runtimeConfig.Model = cfg.Harness.Model
+		runtimeConfig.Effort = cfg.Harness.ReasoningEffort
+		runtimeConfig.LegacyEffort = cfg.Harness.UsesLegacyReasoningEffort()
+		runtimeConfig.ServiceMode = cfg.Harness.ServiceMode
+	} else if name == "acp" {
+		// There is currently one custom ACP command/argument configuration.
+		// Allow an explicitly routed custom ACP harness to reuse it.
+		customCommand = cfg.Harness.ACPCommand
+		customArgs = cfg.Harness.ACPArgs
+	}
+
+	command, commandErr := harness.ResolveConfiguredCommand(name, customCommand, nil)
+	if commandErr != nil {
+		if definition, ok := harness.Lookup(name); ok {
+			command = definition.Command
+		}
+	}
+
+	runtimeConfig.Command = command
+	runtimeConfig.Args = harness.CommandArgs(name, customArgs)
+
+	return harness.NewSupervisor(registry, runtimeConfig)
+}
+
 func buildService(cfg config.Config, version string) (*app.Service, error) {
 	if err := workspace.Upgrade(cfg.Root); err != nil {
 		return nil, fmt.Errorf("upgrade Spynel workspace: %w", err)
 	}
-	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d", os.Getpid()))
+
+	runtimeState := app.NewRuntimeAt(
+		cfg.StatePath("runtime", "logs"),
+		fmt.Sprintf("pid-%d", os.Getpid()),
+	)
+
 	registry := harness.NewBuiltinRegistry()
-	command, commandErr := harness.ResolveConfiguredCommand(cfg.Harness.Name, cfg.Harness.ACPCommand, nil)
-	if commandErr != nil {
-		if definition, ok := harness.Lookup(cfg.Harness.Name); ok {
-			command = definition.Command
+
+	primary := newHarnessSupervisor(
+		registry,
+		cfg,
+		cfg.Harness.Name,
+		version,
+		runtimeState,
+		true,
+	)
+
+	service := app.NewWithRuntime(cfg, primary, runtimeState)
+
+	if cfg.Harness.RoleRoutingEnabled() {
+		routes := make(map[harness.Role]harness.Harness)
+		byName := make(map[string]harness.Harness)
+		additional := make([]harness.Harness, 0)
+
+		roles := []harness.Role{
+			harness.RoleDeveloper,
+			harness.RoleReviewer,
+			harness.RoleNotification,
+			harness.RoleHeartbeat,
+		}
+
+		for _, role := range roles {
+			name := cfg.Harness.NameForRole(role)
+
+			// The primary harness is already the RoleSet fallback and remains
+			// the communication/chat harness, so it needs no explicit route.
+			if name == "" || name == cfg.Harness.Name {
+				continue
+			}
+
+			target, exists := byName[name]
+			if !exists {
+				target = newHarnessSupervisor(
+					registry,
+					cfg,
+					name,
+					version,
+					runtimeState,
+					false,
+				)
+				byName[name] = target
+				additional = append(additional, target)
+			}
+
+			routes[role] = target
+		}
+
+		if len(routes) != 0 {
+			service.SetRoleHarnessRuntime(
+				harness.NewRoleSet(primary, routes, additional...),
+			)
 		}
 	}
-	target := harness.NewSupervisor(registry, harness.HarnessConfig{
-		Name: cfg.Harness.Name, Command: command, Args: cfg.HarnessArgs(), Cwd: cfg.Root,
-		Model: cfg.Harness.Model, Effort: cfg.Harness.ReasoningEffort, LegacyEffort: cfg.Harness.UsesLegacyReasoningEffort(), ServiceMode: cfg.Harness.ServiceMode,
-		ApprovalPolicy: "never", Sandbox: cfg.Harness.Sandbox,
-		Network: false, SessionsFile: cfg.HarnessSessionsPath(cfg.Harness.Name),
-		Version: version, Stderr: runtimeState.Writer("harness"),
-	})
-	service := app.NewWithRuntime(cfg, target, runtimeState)
+
 	service.Updates = updater.Detect(version)
+
 	startup, err := startupmanager.New("")
 	if err != nil {
-		service.Runtime.LogEvent("error", "startup", "manager_failed", "Startup manager initialization failed")
+		service.Runtime.LogEvent(
+			"error",
+			"startup",
+			"manager_failed",
+			"Startup manager initialization failed",
+		)
 		_ = service.Close()
 		return nil, fmt.Errorf("initialize startup manager: %w", err)
 	}
+
 	startup.Log = service.Runtime.Writer("startup.registration")
 	service.Startup = startup
 	return service, nil
