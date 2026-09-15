@@ -2,7 +2,7 @@
 
 ## Purpose
 
-- Own the provider-neutral harness interface, catalog/factories, transactional supervisor, role-to-harness routing, and Codex, Claude Code, Agent Zero CLI, Pi, and ACP process adapters.
+- Own the provider-neutral harness interface, catalog/factories, transactional supervisor, role-to-harness routing and additional-role lifecycle, and Codex, Claude Code, Agent Zero CLI, Pi, and ACP process adapters.
 - Keep role routing provider-neutral: callers select logical roles such as chat, developer, reviewer, notification, or heartbeat; concrete provider names remain confined to harness configuration and adapters.
 
 ## Local Contracts
