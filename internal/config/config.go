@@ -423,6 +423,7 @@ func (c Config) Validate() error {
 			problems = append(problems, "harness.name is not a supported coding harness")
 		}
 	}
+	routedACP := false
 	if c.Harness.Routing != nil {
 		for _, route := range []struct {
 			name  string
@@ -436,13 +437,16 @@ func (c Config) Validate() error {
 			if route.value == "" {
 				continue
 			}
+			if route.value == "acp" {
+				routedACP = true
+			}
 			if _, ok := harness.Lookup(route.value); !ok {
 				problems = append(problems, "harness.routing."+route.name+" is not a supported coding harness")
 			}
 		}
 	}
-	if c.Harness.Name == "acp" && strings.TrimSpace(c.Harness.ACPCommand) == "" {
-		problems = append(problems, "harness.acp_command is required when harness.name is acp")
+	if (c.Harness.Name == "acp" || routedACP) && strings.TrimSpace(c.Harness.ACPCommand) == "" {
+		problems = append(problems, "harness.acp_command is required when harness.name or harness.routing selects acp")
 	}
 	if len(c.Harness.Model) > 1024 || !utf8.ValidString(c.Harness.Model) || strings.IndexFunc(c.Harness.Model, unicode.IsControl) >= 0 {
 		problems = append(problems, "harness.model must be one line of at most 1024 bytes")

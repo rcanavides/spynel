@@ -473,3 +473,20 @@ func TestStoreUpdateSavesAndReloadsSharedSnapshot(t *testing.T) {
 		t.Fatalf("shared snapshot was not refreshed: update=%q snapshot=%q", updated.Channels.Telegram.Name, store.Snapshot().Channels.Telegram.Name)
 	}
 }
+
+func TestValidateRequiresACPCommandForRoutedACP(t *testing.T) {
+	cfg := Default()
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Routing = &HarnessRouting{
+		Developer: "acp",
+	}
+	cfg.Harness.ACPCommand = ""
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("routed ACP configuration without harness.acp_command unexpectedly validated")
+	}
+	if !strings.Contains(err.Error(), "harness.acp_command") {
+		t.Fatalf("validation error = %q, want harness.acp_command", err)
+	}
+}

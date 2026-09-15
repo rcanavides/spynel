@@ -4,6 +4,7 @@
 
 - Own the provider-neutral harness interface, catalog/factories, transactional supervisor, role-to-harness routing and additional-role lifecycle, and Codex, Claude Code, Agent Zero CLI, Pi, and ACP process adapters.
 - Keep role routing provider-neutral: callers select logical roles such as chat, developer, reviewer, notification, or heartbeat; concrete provider names remain confined to harness configuration and adapters.
+- Keep additional-role lifecycle replacement fail-closed and idle-only. A routed supervisor reports only aggregate admitted-turn activity for lifecycle fencing; unknown activity state blocks replacement, and active routed provider work must never be retired by live reconfiguration.
 
 ## Local Contracts
 

@@ -1217,15 +1217,35 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	inferenceCommitter, canCommitInference := s.Harness.(interface {
 		CommitInference(harness.InferenceSelection, func() error) error
 	})
-	harnessChanged := harnessRuntimeChanged(previous.Harness, next.Harness) || inferenceChanged && !canCommitInference
+	primaryHarnessChanged := harnessRuntimeChanged(previous.Harness, next.Harness) || inferenceChanged && !canCommitInference
+	roleHarnessChanged := roleHarnessRuntimeChanged(previous.Harness, next.Harness)
 	startupRequested := requestedSetting(values, "startup.enabled")
 	if startupRequested && s.Startup == nil {
 		return nil, errors.New("autostart registration is unavailable")
 	}
-	if harnessChanged {
+	var roleHarnessReconfigured bool
+	roleReconfigurer, canReconfigureRoles := s.RoleHarnesses.(interface {
+		ReconfigureRoleHarnesses(config.Config) error
+	})
+
+	if primaryHarnessChanged {
 		if err := s.reconfigureHarness(next); err != nil {
 			return nil, err
 		}
+	}
+
+	if canReconfigureRoles && roleHarnessChanged {
+		if err := roleReconfigurer.ReconfigureRoleHarnesses(next); err != nil {
+			var rollback error
+			if primaryHarnessChanged {
+				rollback = s.reconfigureHarness(previous)
+			}
+			return nil, errors.Join(
+				err,
+				wrapRollback("primary harness", rollback),
+			)
+		}
+		roleHarnessReconfigured = true
 	}
 	if unchanged && !startupRequested {
 		if themeChanged {
@@ -1242,18 +1262,28 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		})
 		return updateErr
 	}
-	if inferenceChanged && canCommitInference && !harnessChanged {
+	if inferenceChanged && canCommitInference && !primaryHarnessChanged {
 		err = inferenceCommitter.CommitInference(harness.InferenceSelection{Model: next.Harness.Model, Effort: next.Harness.ReasoningEffort, LegacyEffort: next.Harness.UsesLegacyReasoningEffort(), ServiceMode: next.Harness.ServiceMode}, update)
 	} else {
 		err = update()
 	}
 	if err != nil {
-		var rollback error
-		if harnessChanged {
-			rollback = s.reconfigureHarness(previous)
+		var roleRollback error
+		if roleHarnessReconfigured {
+			roleRollback = roleReconfigurer.ReconfigureRoleHarnesses(previous)
 		}
+
+		var primaryRollback error
+		if primaryHarnessChanged {
+			primaryRollback = s.reconfigureHarness(previous)
+		}
+
 		s.Runtime.LogEvent("error", "config", "persist_failed", "Configuration persistence failed")
-		return nil, errors.Join(err, wrapRollback("harness", rollback))
+		return nil, errors.Join(
+			err,
+			wrapRollback("role harnesses", roleRollback),
+			wrapRollback("primary harness", primaryRollback),
+		)
 	}
 	next = reloaded
 	for _, setting := range changed {
@@ -1477,6 +1507,35 @@ func harnessRuntimeChanged(previous, next config.Harness) bool {
 		return false
 	}
 	return previous.ACPCommand != next.ACPCommand || !reflect.DeepEqual(previous.ACPArgs, next.ACPArgs)
+}
+
+func roleHarnessRuntimeChanged(previous, next config.Harness) bool {
+	// Changing the primary provider changes which routed roles collapse onto
+	// the shared primary supervisor. Sandbox is shared execution policy and
+	// must therefore propagate to every routed supervisor.
+	if previous.Name != next.Name || previous.Sandbox != next.Sandbox {
+		return true
+	}
+
+	// ACP command/arguments are global today. They affect the routed runtime
+	// only when an explicit routed role selects the custom ACP profile.
+	if !routedACPSelected(previous) && !routedACPSelected(next) {
+		return false
+	}
+
+	return previous.ACPCommand != next.ACPCommand ||
+		!reflect.DeepEqual(previous.ACPArgs, next.ACPArgs)
+}
+
+func routedACPSelected(settings config.Harness) bool {
+	if settings.Routing == nil {
+		return false
+	}
+
+	return settings.Routing.Developer == "acp" ||
+		settings.Routing.Reviewer == "acp" ||
+		settings.Routing.Notification == "acp" ||
+		settings.Routing.Heartbeat == "acp"
 }
 
 func harnessAgentPolicyChanged(previous, next config.Harness) bool {

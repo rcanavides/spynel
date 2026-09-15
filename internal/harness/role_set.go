@@ -88,6 +88,29 @@ func (s *RoleSet) Start(ctx context.Context) error {
 	return nil
 }
 
+// EnsureIdle verifies that every independently owned routed harness can prove
+// that it has no admitted provider work. Unknown activity state fails closed.
+func (s *RoleSet) EnsureIdle() error {
+	if s == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, target := range s.additional {
+		reporter, ok := target.(ActiveTurnReporter)
+		if !ok {
+			return errors.New("cannot reconfigure routed harnesses: active-turn state is unavailable")
+		}
+		if reporter.HasActiveTurns() {
+			return errors.New("cannot change routed harnesses while a harness turn is active; use /stop or wait for completion")
+		}
+	}
+
+	return nil
+}
+
 // Close closes additional harnesses in reverse startup order. It attempts every
 // close and returns the combined errors, if any.
 func (s *RoleSet) Close() error {

@@ -1191,48 +1191,15 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 	service := app.NewWithRuntime(cfg, primary, runtimeState)
 
 	if cfg.Harness.RoleRoutingEnabled() {
-		routes := make(map[harness.Role]harness.Harness)
-		byName := make(map[string]harness.Harness)
-		additional := make([]harness.Harness, 0)
-
-		roles := []harness.Role{
-			harness.RoleDeveloper,
-			harness.RoleReviewer,
-			harness.RoleNotification,
-			harness.RoleHeartbeat,
-		}
-
-		for _, role := range roles {
-			name := cfg.Harness.NameForRole(role)
-
-			// The primary harness is already the RoleSet fallback and remains
-			// the communication/chat harness, so it needs no explicit route.
-			if name == "" || name == cfg.Harness.Name {
-				continue
-			}
-
-			target, exists := byName[name]
-			if !exists {
-				target = newHarnessSupervisor(
-					registry,
-					cfg,
-					name,
-					version,
-					runtimeState,
-					false,
-				)
-				byName[name] = target
-				additional = append(additional, target)
-			}
-
-			routes[role] = target
-		}
-
-		if len(routes) != 0 {
-			service.SetRoleHarnessRuntime(
-				harness.NewRoleSet(primary, routes, additional...),
-			)
-		}
+		service.SetRoleHarnessRuntime(
+			newRoutedHarnessRuntime(
+				primary,
+				registry,
+				cfg,
+				version,
+				runtimeState,
+			),
+		)
 	}
 
 	service.Updates = updater.Detect(version)

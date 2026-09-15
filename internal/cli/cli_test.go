@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -1795,10 +1796,15 @@ func TestBuildServiceConstructsUniqueRoutedHarnesses(t *testing.T) {
 		t.Fatal("routed configuration did not create role harness runtime")
 	}
 
-	developer := service.RoleHarnesses.HarnessForRole(harness.RoleDeveloper)
-	reviewer := service.RoleHarnesses.HarnessForRole(harness.RoleReviewer)
-	heartbeat := service.RoleHarnesses.HarnessForRole(harness.RoleHeartbeat)
-	notification := service.RoleHarnesses.HarnessForRole(harness.RoleNotification)
+	roleRuntime, ok := service.RoleHarnesses.(*routedHarnessRuntime)
+	if !ok {
+		t.Fatalf("role harness runtime type = %T, want *routedHarnessRuntime", service.RoleHarnesses)
+	}
+
+	developer := roleRuntime.targetForRole(harness.RoleDeveloper)
+	reviewer := roleRuntime.targetForRole(harness.RoleReviewer)
+	heartbeat := roleRuntime.targetForRole(harness.RoleHeartbeat)
+	notification := roleRuntime.targetForRole(harness.RoleNotification)
 
 	if developer == service.Harness {
 		t.Fatal("developer unexpectedly resolved to primary harness")
@@ -1914,5 +1920,383 @@ func TestNewRoutedHarnessDoesNotInheritPrimaryInference(t *testing.T) {
 	}
 	if runtimeConfig.ServiceMode != "" {
 		t.Fatalf("routed harness inherited primary service mode %q", runtimeConfig.ServiceMode)
+	}
+}
+
+func TestBuildServiceLiveSandboxPropagatesToRoutedHarnesses(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Model = ""
+	cfg.Harness.ReasoningEffort = ""
+	cfg.Harness.ServiceMode = ""
+	cfg.Harness.Sandbox = "danger-full-access"
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer: "codex",
+		Reviewer:  "claude-code",
+	}
+
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	if _, err := service.ApplySettings(map[string]string{
+		"harness.sandbox": "workspace-write",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	primary, ok := service.Harness.(*harness.Supervisor)
+	if !ok {
+		t.Fatalf("primary harness type = %T, want *harness.Supervisor", service.Harness)
+	}
+
+	roleRuntime, ok := service.RoleHarnesses.(*routedHarnessRuntime)
+	if !ok {
+		t.Fatalf("role harness runtime type = %T, want *routedHarnessRuntime", service.RoleHarnesses)
+	}
+
+	developer, ok := roleRuntime.targetForRole(harness.RoleDeveloper).(*harness.Supervisor)
+	if !ok {
+		t.Fatalf(
+			"developer harness type = %T, want *harness.Supervisor",
+			roleRuntime.targetForRole(harness.RoleDeveloper),
+		)
+	}
+
+	reviewer, ok := roleRuntime.targetForRole(harness.RoleReviewer).(*harness.Supervisor)
+	if !ok {
+		t.Fatalf(
+			"reviewer harness type = %T, want *harness.Supervisor",
+			roleRuntime.targetForRole(harness.RoleReviewer),
+		)
+	}
+
+	for name, target := range map[string]*harness.Supervisor{
+		"primary":   primary,
+		"developer": developer,
+		"reviewer":  reviewer,
+	} {
+		if got := target.HarnessConfig().Sandbox; got != "workspace-write" {
+			t.Fatalf("%s sandbox = %q, want workspace-write", name, got)
+		}
+	}
+}
+
+func TestBuildServiceLivePrimaryChangeReusesPrimaryForMatchingRoute(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Model = ""
+	cfg.Harness.ReasoningEffort = ""
+	cfg.Harness.ServiceMode = ""
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer: "codex",
+		Reviewer:  "claude-code",
+	}
+
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	primary := service.Harness
+
+	roleRuntime, ok := service.RoleHarnesses.(*routedHarnessRuntime)
+	if !ok {
+		t.Fatalf("role harness runtime type = %T, want *routedHarnessRuntime", service.RoleHarnesses)
+	}
+
+	before := roleRuntime.targetForRole(harness.RoleDeveloper)
+	if before == primary {
+		t.Fatal("developer unexpectedly used primary before harness.name changed")
+	}
+
+	if _, err := service.ApplySettings(map[string]string{
+		"harness.name": "codex",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	after := roleRuntime.targetForRole(harness.RoleDeveloper)
+	if after != primary {
+		t.Fatalf(
+			"developer route still uses stale additional harness %T after primary changed to codex",
+			after,
+		)
+	}
+}
+
+type busyRoutedHarness struct {
+	active bool
+	closed bool
+	sends  int
+}
+
+func (h *busyRoutedHarness) Start(context.Context) error {
+	return nil
+}
+
+func (h *busyRoutedHarness) Send(
+	context.Context,
+	string,
+	string,
+	core.Emit,
+) (string, bool, error) {
+	if h.closed {
+		return "", false, errors.New("harness is closed")
+	}
+	h.sends++
+	h.active = true
+	return "thread-test", false, nil
+}
+
+func (h *busyRoutedHarness) Interrupt(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (h *busyRoutedHarness) ResetSession(string) error {
+	return nil
+}
+
+func (h *busyRoutedHarness) ThreadID(string) string {
+	return ""
+}
+
+func (h *busyRoutedHarness) IsActive(string) bool {
+	return h.active
+}
+
+func (h *busyRoutedHarness) HasActiveTurns() bool {
+	return h.active
+}
+
+func (h *busyRoutedHarness) Close() error {
+	h.closed = true
+	return nil
+}
+
+func TestRoutedHarnessRuntimeRejectsLiveReconfigureWhileRoutedTurnActive(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	primary := &busyRoutedHarness{}
+	developer := &busyRoutedHarness{active: true}
+
+	current := harness.NewRoleSet(
+		primary,
+		map[harness.Role]harness.Harness{
+			harness.RoleDeveloper: developer,
+		},
+		developer,
+	)
+
+	ctx := context.Background()
+
+	if err := current.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := &routedHarnessRuntime{
+		registry: harness.NewBuiltinRegistry(),
+		primary:  primary,
+		version:  "test",
+		current:  current,
+		ctx:      ctx,
+		started:  true,
+	}
+
+	// Changing the primary to codex makes the developer route collapse onto
+	// the primary. That topology change must not retire the currently active
+	// routed developer harness.
+	cfg.Harness.Name = "codex"
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer: "codex",
+	}
+
+	err = runtime.ReconfigureRoleHarnesses(cfg)
+	if err == nil {
+		t.Fatal("live routed reconfiguration succeeded while developer turn was active")
+	}
+
+	if developer.closed {
+		t.Fatal("active routed developer harness was closed by rejected reconfiguration")
+	}
+
+	if got := runtime.targetForRole(harness.RoleDeveloper); got != developer {
+		t.Fatalf(
+			"developer route changed after rejected reconfiguration: got %T",
+			got,
+		)
+	}
+}
+
+func TestRoutedHarnessRoleHandleDoesNotBecomeStaleAcrossLiveReconfigure(t *testing.T) {
+	primary := &busyRoutedHarness{}
+	developer := &busyRoutedHarness{}
+
+	current := harness.NewRoleSet(
+		primary,
+		map[harness.Role]harness.Harness{
+			harness.RoleDeveloper: developer,
+		},
+		developer,
+	)
+
+	ctx := context.Background()
+
+	if err := current.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := &routedHarnessRuntime{
+		primary: primary,
+		current: current,
+		ctx:     ctx,
+		started: true,
+	}
+
+	// Simula al orchestrador resolviendo el rol inmediatamente antes de que
+	// otra goroutine confirme una reconfiguración live.
+	handle := runtime.HarnessForRole(harness.RoleDeveloper)
+
+	cfg := config.Config{}
+	cfg.Harness.Name = "codex"
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer: "codex",
+	}
+
+	// El developer ahora debe colapsar sobre el primary.
+	if err := runtime.ReconfigureRoleHarnesses(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Un handle obtenido antes del commit no debe quedar apuntando al routed
+	// harness retirado. El envío debe observar la topología vigente.
+	if _, _, err := handle.Send(
+		context.Background(),
+		"race-proof",
+		"test",
+		nil,
+	); err != nil {
+		t.Fatalf("pre-commit role handle became stale after live reconfigure: %v", err)
+	}
+
+	if developer.sends != 0 {
+		t.Fatalf(
+			"retired developer received %d sends after live reconfigure",
+			developer.sends,
+		)
+	}
+
+	if primary.sends != 1 {
+		t.Fatalf(
+			"primary received %d sends after developer route collapsed onto primary, want 1",
+			primary.sends,
+		)
+	}
+}
+
+func TestBuildServiceLiveACPArgsPropagateToRoutedACP(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Model = ""
+	cfg.Harness.ReasoningEffort = ""
+	cfg.Harness.ServiceMode = ""
+	cfg.Harness.ACPCommand = executable
+	cfg.Harness.ACPArgs = []string{"before"}
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer: "acp",
+	}
+
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	roleRuntime, ok := service.RoleHarnesses.(*routedHarnessRuntime)
+	if !ok {
+		t.Fatalf(
+			"role harness runtime type = %T, want *routedHarnessRuntime",
+			service.RoleHarnesses,
+		)
+	}
+
+	before, ok := roleRuntime.targetForRole(
+		harness.RoleDeveloper,
+	).(*harness.Supervisor)
+	if !ok {
+		t.Fatalf(
+			"developer harness type = %T, want *harness.Supervisor",
+			roleRuntime.targetForRole(harness.RoleDeveloper),
+		)
+	}
+
+	if got := before.HarnessConfig().Args; !reflect.DeepEqual(got, []string{"before"}) {
+		t.Fatalf("initial routed ACP args = %#v, want [before]", got)
+	}
+
+	if _, err := service.ApplySettings(map[string]string{
+		"harness.acp_args": "after",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	after, ok := roleRuntime.targetForRole(
+		harness.RoleDeveloper,
+	).(*harness.Supervisor)
+	if !ok {
+		t.Fatalf(
+			"developer harness type after change = %T, want *harness.Supervisor",
+			roleRuntime.targetForRole(harness.RoleDeveloper),
+		)
+	}
+
+	if got := after.HarnessConfig().Args; !reflect.DeepEqual(got, []string{"after"}) {
+		t.Fatalf(
+			"routed ACP args after live update = %#v, want [after]",
+			got,
+		)
 	}
 }

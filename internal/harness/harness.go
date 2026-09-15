@@ -195,6 +195,13 @@ type ConversationSender interface {
 	SendConversation(context.Context, string, string, string, core.Emit) (threadID string, steered bool, err error)
 }
 
+// ActiveTurnReporter exposes only whether a harness currently owns admitted
+// provider work. Runtime topology changes use it to fail closed instead of
+// retiring a harness that is still executing.
+type ActiveTurnReporter interface {
+	HasActiveTurns() bool
+}
+
 type Harness interface {
 	Start(context.Context) error
 	Send(context.Context, string, string, core.Emit) (threadID string, steered bool, err error)

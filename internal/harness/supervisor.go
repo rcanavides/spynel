@@ -830,6 +830,15 @@ func (s *Supervisor) IsActive(key string) bool {
 	return active
 }
 
+// HasActiveTurns reports whether this supervisor currently owns any admitted
+// harness execution. It is intentionally provider-neutral and does not expose
+// session identities.
+func (s *Supervisor) HasActiveTurns() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.active) > 0
+}
+
 func (s *Supervisor) Close() error {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
