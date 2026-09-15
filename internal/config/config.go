@@ -56,19 +56,77 @@ type Workspace struct {
 // executables and the workspace directory remain derived by Spynel; only the
 // explicit custom ACP profile accepts a command and shell-free argument list.
 type Harness struct {
-	Name                   string   `yaml:"name"`
-	Model                  string   `yaml:"model,omitempty"`
-	ReasoningEffort        string   `yaml:"reasoning_effort"`
-	ServiceMode            string   `yaml:"service_mode"`
-	Sandbox                string   `yaml:"sandbox"`
-	ChatAgentPrefix        string   `yaml:"chat_agent_prefix"`
-	DeveloperAgentPrefix   string   `yaml:"developer_agent_prefix"`
-	ReviewerAgentPrefix    string   `yaml:"reviewer_agent_prefix"`
-	HeartbeatAgentPrefix   string   `yaml:"heartbeat_agent_prefix"`
-	Reviews                string   `yaml:"reviews"`
-	ACPCommand             string   `yaml:"acp_command,omitempty"`
-	ACPArgs                []string `yaml:"acp_args,omitempty"`
+	Name                   string          `yaml:"name"`
+	Model                  string          `yaml:"model,omitempty"`
+	ReasoningEffort        string          `yaml:"reasoning_effort"`
+	ServiceMode            string          `yaml:"service_mode"`
+	Sandbox                string          `yaml:"sandbox"`
+	Routing                *HarnessRouting `yaml:"routing,omitempty"`
+	ChatAgentPrefix        string          `yaml:"chat_agent_prefix"`
+	DeveloperAgentPrefix   string          `yaml:"developer_agent_prefix"`
+	ReviewerAgentPrefix    string          `yaml:"reviewer_agent_prefix"`
+	HeartbeatAgentPrefix   string          `yaml:"heartbeat_agent_prefix"`
+	Reviews                string          `yaml:"reviews"`
+	ACPCommand             string          `yaml:"acp_command,omitempty"`
+	ACPArgs                []string        `yaml:"acp_args,omitempty"`
 	reasoningEffortOmitted bool
+}
+
+// HarnessRouting assigns logical agent roles to harness profiles.
+// Empty role values inherit Harness.Name, preserving the legacy
+// single-harness configuration when routing is absent or partial.
+type HarnessRouting struct {
+	Developer    string `yaml:"developer,omitempty"`
+	Reviewer     string `yaml:"reviewer,omitempty"`
+	Notification string `yaml:"notification,omitempty"`
+	Heartbeat    string `yaml:"heartbeat,omitempty"`
+}
+
+// NameForRole returns the configured harness profile for one logical role.
+// Missing routing entries inherit the legacy/default Harness.Name.
+func (h Harness) NameForRole(role harness.Role) string {
+	if h.Routing == nil {
+		return h.Name
+	}
+
+	var name string
+	switch role {
+	case harness.RoleDeveloper:
+		name = h.Routing.Developer
+	case harness.RoleReviewer:
+		name = h.Routing.Reviewer
+	case harness.RoleNotification:
+		name = h.Routing.Notification
+	case harness.RoleHeartbeat:
+		name = h.Routing.Heartbeat
+	}
+
+	if name == "" {
+		return h.Name
+	}
+	return name
+}
+
+// RoleRoutingEnabled reports whether at least one logical role explicitly
+// selects a harness different from inherited single-harness behavior.
+func (h Harness) RoleRoutingEnabled() bool {
+	if h.Routing == nil {
+		return false
+	}
+	return h.Routing.Developer != "" ||
+		h.Routing.Reviewer != "" ||
+		h.Routing.Notification != "" ||
+		h.Routing.Heartbeat != ""
+}
+
+func normalizeHarnessRouting(routing *HarnessRouting) {
+	if routing == nil {
+		return
+	}
+	routing.Developer = harness.NormalizeName(routing.Developer)
+	routing.Reviewer = harness.NormalizeName(routing.Reviewer)
+	routing.Notification = harness.NormalizeName(routing.Notification)
+	routing.Heartbeat = harness.NormalizeName(routing.Heartbeat)
 }
 
 // UsesLegacyReasoningEffort reports whether the historical medium value came
@@ -284,6 +342,7 @@ func decode(data []byte, abs string) (Config, error) {
 		return Config{}, fmt.Errorf("parse %s: %w", abs, err)
 	}
 	cfg.Harness.Name = harness.NormalizeName(cfg.Harness.Name)
+	normalizeHarnessRouting(cfg.Harness.Routing)
 	cfg.Harness.ReasoningEffort = normalizeInheritedValue(cfg.Harness.ReasoningEffort)
 	cfg.Harness.ServiceMode = normalizeServiceMode(cfg.Harness.ServiceMode)
 	cfg.Harness.Sandbox = normalizeSandbox(cfg.Harness.Sandbox)
@@ -362,6 +421,24 @@ func (c Config) Validate() error {
 	if c.Harness.Name != "" {
 		if _, ok := harness.Lookup(c.Harness.Name); !ok {
 			problems = append(problems, "harness.name is not a supported coding harness")
+		}
+	}
+	if c.Harness.Routing != nil {
+		for _, route := range []struct {
+			name  string
+			value string
+		}{
+			{name: "developer", value: c.Harness.Routing.Developer},
+			{name: "reviewer", value: c.Harness.Routing.Reviewer},
+			{name: "notification", value: c.Harness.Routing.Notification},
+			{name: "heartbeat", value: c.Harness.Routing.Heartbeat},
+		} {
+			if route.value == "" {
+				continue
+			}
+			if _, ok := harness.Lookup(route.value); !ok {
+				problems = append(problems, "harness.routing."+route.name+" is not a supported coding harness")
+			}
 		}
 	}
 	if c.Harness.Name == "acp" && strings.TrimSpace(c.Harness.ACPCommand) == "" {
