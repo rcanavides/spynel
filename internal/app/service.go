@@ -30,12 +30,21 @@ import (
 	"github.com/agent0ai/spynel/internal/updater"
 )
 
+// RoleHarnessRuntime owns additional role-specific harnesses while the
+// ordinary Service.Harness remains the communication/chat harness.
+type RoleHarnessRuntime interface {
+	harness.RoleRouter
+	Start(context.Context) error
+	Close() error
+}
+
 type Service struct {
 	// Config is the immutable structural configuration used to construct
 	// histories, hooks, routes, and workspace paths. Live scalar values are
 	// always read through Settings, avoiding races with remote form commands.
 	Config          config.Config
 	Harness         harness.Harness
+	RoleHarnesses   RoleHarnessRuntime
 	History         *history.Store
 	Hooks           extensions.Runner
 	Orchestrator    *orchestrator.Manager
@@ -198,14 +207,29 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	return service
 }
 
+// SetRoleHarnessRuntime attaches additional role-specific harnesses to the
+// service and exposes the same provider-neutral router to the orchestrator.
+func (s *Service) SetRoleHarnessRuntime(runtime RoleHarnessRuntime) {
+	s.RoleHarnesses = runtime
+	if s.Orchestrator != nil {
+		s.Orchestrator.HarnessRouter = runtime
+	}
+}
+
 // Close stops the harness while its final diagnostics can still be captured,
 // then drains and closes the durable runtime log.
 func (s *Service) Close() error {
 	s.stopRecoveryScanner()
-	err := s.Harness.Close()
+
+	var routedErr error
+	if s.RoleHarnesses != nil {
+		routedErr = s.RoleHarnesses.Close()
+	}
+
+	harnessErr := s.Harness.Close()
 	s.stopAllChatActivity()
 	s.Runtime.Close()
-	return err
+	return errors.Join(routedErr, harnessErr)
 }
 
 func (s *Service) validateOrigin(origin orchestrator.Origin) error {
@@ -398,14 +422,25 @@ func remoteAuthorizedPrincipalCount(cfg config.Config) int {
 }
 
 func (s *Service) Start(ctx context.Context) error {
-	err := s.Harness.Start(ctx)
+	var startErrors []error
+
+	if err := s.Harness.Start(ctx); err != nil {
+		startErrors = append(startErrors, err)
+	}
+
+	if s.RoleHarnesses != nil {
+		if err := s.RoleHarnesses.Start(ctx); err != nil {
+			startErrors = append(startErrors, fmt.Errorf("start routed harnesses: %w", err))
+		}
+	}
+
 	s.recoveryMu.Lock()
 	s.serviceStarted = true
 	s.recoveryMu.Unlock()
 	if s.primaryInstanceID() != "" {
 		s.startRecoveryScanner()
 	}
-	return err
+	return errors.Join(startErrors...)
 }
 
 // SetPrimaryInstanceID records the workspace server owner for shared status
