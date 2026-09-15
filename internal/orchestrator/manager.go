@@ -216,7 +216,7 @@ func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Ma
 		parallel = 1
 	}
 	manager := &Manager{
-		Config: cfg, runtimeConfig: cfg, Harness: target, HarnessRouter: harness.NewStaticRoleRouter(target, nil), Hooks: hooks, inflight: map[string]bool{}, runtimeJobs: map[string]int{}, controlCancelled: map[string]int{}, capacityLimit: parallel,
+		Config: cfg, runtimeConfig: cfg, Harness: target, Hooks: hooks, inflight: map[string]bool{}, runtimeJobs: map[string]int{}, controlCancelled: map[string]int{}, capacityLimit: parallel,
 		Outbox:                 &Outbox{Directory: cfg.StatePath("runtime", "outbox")},
 		ownerID:                fmt.Sprintf("%d-%d-%s", os.Getpid(), time.Now().UTC().UnixNano(), randomSuffix()),
 		scanNow:                make(chan struct{}, 1),
@@ -1539,17 +1539,9 @@ func (m *Manager) renderPrompt(route workflowRoute, lease Lease, promptPath stri
 	return instructions.Append(prompt, m.Config.StatePath(), role)
 }
 
-// harnessForPhase resolves provider work by logical orchestration role.
-// Implementation and planning use the developer role; independent review
-// uses the reviewer role. The legacy Harness remains the fallback.
-func (m *Manager) harnessForPhase(phase string) harness.Harness {
-	role := harness.RoleDeveloper
-
-	switch normalizeLeasePhase("", phase) {
-	case phaseTaskReview, phaseGoalReview:
-		role = harness.RoleReviewer
-	}
-
+// harnessForRole resolves one logical orchestration role while preserving the
+// legacy single-harness behavior as a fallback.
+func (m *Manager) harnessForRole(role harness.Role) harness.Harness {
 	if m.HarnessRouter != nil {
 		if target := m.HarnessRouter.HarnessForRole(role); target != nil {
 			return target
@@ -1557,6 +1549,23 @@ func (m *Manager) harnessForPhase(phase string) harness.Harness {
 	}
 
 	return m.Harness
+}
+
+// harnessForPhase resolves provider work by logical orchestration role.
+// Implementation and planning use developer, independent review uses reviewer,
+// and ordinary background agents use their dedicated notification/heartbeat
+// roles.
+func (m *Manager) harnessForPhase(phase string) harness.Harness {
+	switch normalizeLeasePhase("", phase) {
+	case phaseTaskReview, phaseGoalReview:
+		return m.harnessForRole(harness.RoleReviewer)
+	case "notification":
+		return m.harnessForRole(harness.RoleNotification)
+	case "semantic_heartbeat":
+		return m.harnessForRole(harness.RoleHeartbeat)
+	default:
+		return m.harnessForRole(harness.RoleDeveloper)
+	}
 }
 
 func (m *Manager) harnessSettings() config.Harness {

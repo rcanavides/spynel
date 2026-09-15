@@ -296,11 +296,12 @@ func (m *Manager) runSemanticHeartbeatOnceForTerm(parent context.Context, term u
 	}
 	lease := Lease{DocumentType: "heartbeat", Route: "semantic-heartbeat", SessionKey: semanticHeartbeatSession, State: "working", Phase: "semantic_heartbeat", StartedAt: now, HeartbeatAt: now}
 	message := config.PrependAgentPrefix(m.harnessSettings().HeartbeatAgentPrefix, prompt)
+	target := m.harnessForPhase(lease.Phase)
 	resultReady := make(chan ordinaryAgentResult, 1)
 	providerOwnsFence = true
 	go func() {
 		result := m.runOrdinaryAgentTurn(parent, lease, "semantic workflow heartbeat", message, timeout, 0)
-		if !result.providerSent || !m.Harness.IsActive(semanticHeartbeatSession) {
+		if !result.providerSent || !target.IsActive(semanticHeartbeatSession) {
 			releaseProvider()
 			resultReady <- result
 			return
@@ -308,7 +309,7 @@ func (m *Manager) runSemanticHeartbeatOnceForTerm(parent context.Context, term u
 		resultReady <- result
 		// Timeout or cancellation ends the ordinary job. Cadence remains
 		// fenced until an adapter that ignored interruption actually releases.
-		for result.providerSent && m.Harness.IsActive(semanticHeartbeatSession) {
+		for result.providerSent && target.IsActive(semanticHeartbeatSession) {
 			select {
 			case <-parent.Done():
 				releaseProvider()

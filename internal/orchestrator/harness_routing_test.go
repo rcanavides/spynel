@@ -47,14 +47,18 @@ func TestHarnessForPhaseRoutesByRole(t *testing.T) {
 	fallback := &roleRoutingHarnessFixture{}
 	developer := &roleRoutingHarnessFixture{}
 	reviewer := &roleRoutingHarnessFixture{}
+	notification := &roleRoutingHarnessFixture{}
+	heartbeat := &roleRoutingHarnessFixture{}
 
 	manager := &Manager{
 		Harness: fallback,
 		HarnessRouter: harness.NewStaticRoleRouter(
 			fallback,
 			map[harness.Role]harness.Harness{
-				harness.RoleDeveloper: developer,
-				harness.RoleReviewer:  reviewer,
+				harness.RoleDeveloper:    developer,
+				harness.RoleReviewer:     reviewer,
+				harness.RoleNotification: notification,
+				harness.RoleHeartbeat:    heartbeat,
 			},
 		),
 	}
@@ -84,6 +88,16 @@ func TestHarnessForPhaseRoutesByRole(t *testing.T) {
 			phase: phaseGoalReview,
 			want:  reviewer,
 		},
+		{
+			name:  "notification",
+			phase: "notification",
+			want:  notification,
+		},
+		{
+			name:  "semantic heartbeat",
+			phase: "semantic_heartbeat",
+			want:  heartbeat,
+		},
 	}
 
 	for _, test := range tests {
@@ -97,6 +111,7 @@ func TestHarnessForPhaseRoutesByRole(t *testing.T) {
 
 func TestHarnessForPhaseFallsBackToLegacyHarness(t *testing.T) {
 	fallback := &roleRoutingHarnessFixture{}
+	replacement := &roleRoutingHarnessFixture{}
 
 	manager := &Manager{
 		Harness: fallback,
@@ -104,5 +119,14 @@ func TestHarnessForPhaseFallsBackToLegacyHarness(t *testing.T) {
 
 	if got := manager.harnessForPhase(phaseTaskReview); got != fallback {
 		t.Fatal("expected legacy harness fallback")
+	}
+
+	// Legacy callers may replace Manager.Harness after construction.
+	// Without an explicit role router, phase routing must observe the
+	// currently assigned harness rather than a captured startup value.
+	manager.Harness = replacement
+
+	if got := manager.harnessForPhase(phaseTaskReview); got != replacement {
+		t.Fatal("expected current legacy harness after replacement")
 	}
 }

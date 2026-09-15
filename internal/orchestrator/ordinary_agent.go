@@ -92,7 +92,9 @@ func (m *Manager) runOrdinaryAgentTurn(parent context.Context, lease Lease, desc
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	_, _, err := m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
+
+	target := m.harnessForPhase(lease.Phase)
+	_, _, err := target.Send(ctx, lease.SessionKey, prompt, emit)
 	if err != nil {
 		return recordError(err)
 	}
@@ -102,7 +104,7 @@ func (m *Manager) runOrdinaryAgentTurn(parent context.Context, lease Lease, desc
 		return result
 	default:
 	}
-	if !m.Harness.IsActive(lease.SessionKey) {
+	if !target.IsActive(lease.SessionKey) {
 		// Synchronous providers emit before returning. Recheck after IsActive
 		// so a concurrent terminal callback remains authoritative.
 		select {
@@ -121,7 +123,7 @@ func (m *Manager) runOrdinaryAgentTurn(parent context.Context, lease Lease, desc
 			interruptTimeout = time.Second
 		}
 		interruptCtx, interruptCancel := context.WithTimeout(context.Background(), interruptTimeout)
-		_, _ = m.Harness.Interrupt(interruptCtx, lease.SessionKey)
+		_, _ = target.Interrupt(interruptCtx, lease.SessionKey)
 		interruptCancel()
 		return recordError(ctx.Err())
 	}
