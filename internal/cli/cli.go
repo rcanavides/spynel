@@ -1115,14 +1115,17 @@ func writeCLIEvent(output io.Writer, streamed *strings.Builder, event core.Event
 	return false, nil
 }
 
-func newHarnessSupervisor(
-	registry *harness.Registry,
+func newHarnessSupervisor(registry *harness.Registry, cfg config.Config, name, version string, runtimeState *app.Runtime, primary bool) *harness.Supervisor {
+	return harness.NewSupervisor(registry, harnessSupervisorConfig(cfg, name, version, runtimeState, primary))
+}
+
+func harnessSupervisorConfig(
 	cfg config.Config,
 	name string,
 	version string,
 	runtimeState *app.Runtime,
 	primary bool,
-) *harness.Supervisor {
+) harness.HarnessConfig {
 	customCommand := ""
 	var customArgs []string
 
@@ -1164,7 +1167,7 @@ func newHarnessSupervisor(
 	runtimeConfig.Command = command
 	runtimeConfig.Args = harness.CommandArgs(name, customArgs)
 
-	return harness.NewSupervisor(registry, runtimeConfig)
+	return runtimeConfig
 }
 
 func buildService(cfg config.Config, version string) (*app.Service, error) {
@@ -1179,27 +1182,15 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 
 	registry := harness.NewBuiltinRegistry()
 
-	primary := newHarnessSupervisor(
-		registry,
-		cfg,
-		cfg.Harness.Name,
-		version,
-		runtimeState,
-		true,
-	)
-
-	service := app.NewWithRuntime(cfg, primary, runtimeState)
-
+	var service *app.Service
 	if cfg.Harness.RoleRoutingEnabled() {
-		service.SetRoleHarnessRuntime(
-			newRoutedHarnessRuntime(
-				primary,
-				registry,
-				cfg,
-				version,
-				runtimeState,
-			),
-		)
+		// Keep the old routed composition isolated until its topology migration.
+		primary := newHarnessSupervisor(registry, cfg, cfg.Harness.Name, version, runtimeState, true)
+		service = app.NewWithRuntime(cfg, primary, runtimeState)
+		service.SetRoleHarnessRuntime(newRoutedHarnessRuntime(primary, registry, cfg, version, runtimeState))
+	} else {
+		providers := harness.NewRuntime(registry, harnessSupervisorConfig(cfg, cfg.Harness.Name, version, runtimeState, true))
+		service = app.NewWithHarnessRuntime(cfg, providers, runtimeState)
 	}
 
 	service.Updates = updater.Detect(version)

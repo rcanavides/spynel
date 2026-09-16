@@ -55,7 +55,7 @@ type ScheduledCheckpoint struct {
 
 type Manager struct {
 	Config                   config.Config
-	Harness                  harness.Harness
+	Harness                  harness.ExecutionTarget
 	HarnessRouter            harness.RoleRouter
 	Hooks                    extensions.Runner
 	Log                      func(string)
@@ -210,7 +210,7 @@ func (m *Manager) stopSemanticHeartbeatTimer(expected *time.Timer) {
 	}
 }
 
-func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Manager {
+func New(cfg config.Config, target harness.ExecutionTarget, hooks extensions.Runner) *Manager {
 	parallel := cfg.Orchestrator.MaxParallel
 	if parallel <= 0 {
 		parallel = 1
@@ -1541,7 +1541,7 @@ func (m *Manager) renderPrompt(route workflowRoute, lease Lease, promptPath stri
 
 // harnessForRole resolves one logical orchestration role while preserving the
 // legacy single-harness behavior as a fallback.
-func (m *Manager) harnessForRole(role harness.Role) harness.Harness {
+func (m *Manager) harnessForRole(role harness.Role) harness.ExecutionTarget {
 	if m.HarnessRouter != nil {
 		if target := m.HarnessRouter.HarnessForRole(role); target != nil {
 			return target
@@ -1555,7 +1555,7 @@ func (m *Manager) harnessForRole(role harness.Role) harness.Harness {
 // Implementation and planning use developer, independent review uses reviewer,
 // and ordinary background agents use their dedicated notification/heartbeat
 // roles.
-func (m *Manager) harnessForPhase(phase string) harness.Harness {
+func (m *Manager) harnessForPhase(phase string) harness.ExecutionTarget {
 	switch normalizeLeasePhase("", phase) {
 	case phaseTaskReview, phaseGoalReview:
 		return m.harnessForRole(harness.RoleReviewer)

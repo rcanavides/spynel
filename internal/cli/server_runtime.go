@@ -269,7 +269,7 @@ func (term *primaryTerm) stopFor(targetID string) error {
 		term.service.SetPrimaryInstanceID("")
 		term.cancel()
 		_ = term.listener.Close()
-		_ = term.service.Harness.Close()
+		_ = term.service.ClosePrimaryHarness()
 		<-term.apiDone
 		<-term.channelsDone
 		<-term.orchestratorDone

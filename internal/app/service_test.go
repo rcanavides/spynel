@@ -2834,11 +2834,13 @@ func TestModelCommandPersistsDuringActiveHarnessTurnForNextDispatch(t *testing.T
 	target.configuredModel = "model-old"
 	registry := harness.NewRegistry()
 	registry.Register("codex", func(harness.HarnessConfig) (harness.Harness, error) { return target, nil })
-	supervisor := harness.NewSupervisor(registry, harness.HarnessConfig{Name: "codex", Model: "model-old"})
-	if err := supervisor.Start(context.Background()); err != nil {
+	providers := harness.NewRuntime(registry, harness.HarnessConfig{Name: "codex", Model: "model-old"})
+	if err := providers.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := New(cfg, supervisor)
+	service := NewWithHarnessRuntime(cfg, providers, NewRuntime())
+	defer service.Close()
+	supervisor := providers.AcquireRole(harness.RoleChat)
 	if _, _, err := supervisor.Send(context.Background(), "active", "original", nil); err != nil {
 		t.Fatal(err)
 	}

@@ -1379,6 +1379,15 @@ func TestBuildServiceUsesConfiguredHarnessSandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer service.Close()
+	if service.RoleHarnesses != nil {
+		t.Fatal("single-provider composition attached routed lifecycle")
+	}
+	if _, ok := service.Harness.(interface{ Start(context.Context) error }); ok {
+		t.Fatal("single-provider operational target exposes Start")
+	}
+	if _, ok := service.Harness.(interface{ Close() error }); ok {
+		t.Fatal("single-provider operational target exposes Close")
+	}
 	runtimeHarness, ok := service.Harness.(interface {
 		HarnessConfig() harness.HarnessConfig
 	})

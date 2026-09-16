@@ -38,20 +38,28 @@ type RoleHarnessRuntime interface {
 	Close() error
 }
 
+// providerLifecycle selects one owner per service composition. The single-provider
+// path uses harness.Runtime; the legacy routed path retains its primary owner.
+type providerLifecycle interface {
+	Start(context.Context) error
+	Close() error
+}
+
 type Service struct {
 	// Config is the immutable structural configuration used to construct
 	// histories, hooks, routes, and workspace paths. Live scalar values are
 	// always read through Settings, avoiding races with remote form commands.
-	Config          config.Config
-	Harness         harness.Harness
-	RoleHarnesses   RoleHarnessRuntime
-	History         *history.Store
-	Hooks           extensions.Runner
-	Orchestrator    *orchestrator.Manager
-	Runtime         *Runtime
-	Settings        *config.Store
-	PairingControl  channel.PairingManager
-	DeliveryControl channel.DeliveryRouter
+	Config           config.Config
+	Harness          harness.ExecutionTarget
+	harnessLifecycle providerLifecycle
+	RoleHarnesses    RoleHarnessRuntime
+	History          *history.Store
+	Hooks            extensions.Runner
+	Orchestrator     *orchestrator.Manager
+	Runtime          *Runtime
+	Settings         *config.Store
+	PairingControl   channel.PairingManager
+	DeliveryControl  channel.DeliveryRouter
 	// ConversationDelivery is the ordinary channel response path used by
 	// communication recovery; it is intentionally separate from Notify.
 	ConversationDelivery   channel.DeliveryRouter
@@ -118,7 +126,19 @@ func New(cfg config.Config, target harness.Harness) *Service {
 	return NewWithRuntime(cfg, target, NewRuntime())
 }
 
+// NewWithRuntime retains legacy injected-harness ownership for routed composition
+// and fixtures. Single-provider production composition uses NewWithHarnessRuntime.
 func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime) *Service {
+	return newWithHarnessOwner(cfg, target, target, runtime)
+}
+
+// NewWithHarnessRuntime gives the service operational access while the provider
+// runtime remains the sole owner of its Supervisor lifecycle.
+func NewWithHarnessRuntime(cfg config.Config, providers *harness.Runtime, runtime *Runtime) *Service {
+	return newWithHarnessOwner(cfg, providers.AcquireRole(harness.RoleChat), providers, runtime)
+}
+
+func newWithHarnessOwner(cfg config.Config, target harness.ExecutionTarget, owner providerLifecycle, runtime *Runtime) *Service {
 	runtime.ConfigureJobArchive(cfg.StatePath("jobs"))
 	hooks := extensions.Runner{Directory: cfg.Resolve(cfg.Extensions.Directory), Timeout: cfg.Extensions.Timeout()}
 	hooks.Log = runtime.Writer("extensions")
@@ -138,6 +158,7 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	service := &Service{
 		Config:                cfg,
 		Harness:               target,
+		harnessLifecycle:      owner,
 		History:               store,
 		Hooks:                 hooks,
 		Orchestrator:          manager,
@@ -216,6 +237,10 @@ func (s *Service) SetRoleHarnessRuntime(runtime RoleHarnessRuntime) {
 	}
 }
 
+// ClosePrimaryHarness stops the primary provider through its lifecycle owner.
+// The routed legacy composition continues to close additional providers separately.
+func (s *Service) ClosePrimaryHarness() error { return s.harnessLifecycle.Close() }
+
 // Close stops the harness while its final diagnostics can still be captured,
 // then drains and closes the durable runtime log.
 func (s *Service) Close() error {
@@ -226,7 +251,7 @@ func (s *Service) Close() error {
 		routedErr = s.RoleHarnesses.Close()
 	}
 
-	harnessErr := s.Harness.Close()
+	harnessErr := s.ClosePrimaryHarness()
 	s.stopAllChatActivity()
 	s.Runtime.Close()
 	return errors.Join(routedErr, harnessErr)
@@ -424,7 +449,7 @@ func remoteAuthorizedPrincipalCount(cfg config.Config) int {
 func (s *Service) Start(ctx context.Context) error {
 	var startErrors []error
 
-	if err := s.Harness.Start(ctx); err != nil {
+	if err := s.harnessLifecycle.Start(ctx); err != nil {
 		startErrors = append(startErrors, err)
 	}
 

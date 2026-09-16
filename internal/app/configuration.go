@@ -1547,7 +1547,7 @@ func harnessAgentPolicyChanged(previous, next config.Harness) bool {
 }
 
 func (s *Service) reconfigureHarness(cfg config.Config) error {
-	runtimeHarness, ok := s.Harness.(interface {
+	runtimeHarness, ok := s.harnessLifecycle.(interface {
 		HarnessConfig() harness.HarnessConfig
 		Reconfigure(harness.HarnessConfig) error
 	})
@@ -1571,7 +1571,7 @@ func (s *Service) reconfigureHarness(cfg config.Config) error {
 		if definition, ok := harness.Lookup(cfg.Harness.Name); ok {
 			runtimeConfig.Command = definition.Command
 		}
-		if unavailable, ok := s.Harness.(interface {
+		if unavailable, ok := s.harnessLifecycle.(interface {
 			ConfigureUnavailable(harness.HarnessConfig, error) error
 		}); ok {
 			return unavailable.ConfigureUnavailable(runtimeConfig, err)
