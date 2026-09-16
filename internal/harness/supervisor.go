@@ -23,7 +23,15 @@ const (
 type Supervisor struct {
 	registry *Registry
 
-	operationMu       sync.Mutex
+	lifecycleDone     chan struct{}
+	lifecycleChanged  chan struct{}
+	prepared          *PreparedChange
+	inflightDone      chan struct{}
+	fenced            bool
+	inflight          int
+	inferenceDone     chan struct{}
+	readyVersion      uint64
+	readyChanged      chan struct{}
 	mu                sync.RWMutex
 	ctx               context.Context
 	config            HarnessConfig
@@ -66,7 +74,7 @@ func NewSupervisor(registry *Registry, cfg HarnessConfig) *Supervisor {
 		registry: registry, config: cfg, active: map[string]int{}, pending: map[string][]pendingSend{},
 		controlEmit: map[string]core.Emit{}, controls: map[string]*controlState{}, seenControl: map[string]map[string]time.Time{},
 		controlGeneration: map[string]uint64{}, controlOps: map[string]*sync.Mutex{},
-		ready: make(chan struct{}, 1),
+		ready: make(chan struct{}, 1), readyChanged: make(chan struct{}), lifecycleChanged: make(chan struct{}),
 	}
 }
 
@@ -89,43 +97,62 @@ func (s *Supervisor) CommitModel(model string, commit func() error) error {
 // CommitInference atomically orders persistence and all future inference
 // snapshots. Already-admitted provider work retains its captured selection.
 func (s *Supervisor) CommitInference(selection InferenceSelection, commit func() error) error {
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return errors.New("harness supervisor is closed")
+	if err := s.beginLifecycle(context.Background(), false); err != nil {
+		return err
 	}
-	if s.current != nil {
-		if _, ok := s.current.(InferenceDispatcher); !ok {
-			_, legacy := s.current.(ModelDispatcher)
+	defer s.endLifecycle()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: harness supervisor is closed", ErrProviderUnavailable)
+	}
+	target := s.current
+	if target != nil {
+		if _, ok := target.(InferenceDispatcher); !ok {
+			_, legacy := target.(ModelDispatcher)
 			if !legacy || selection.Effort != s.config.Effort || selection.ServiceMode != s.config.ServiceMode {
+				s.mu.Unlock()
 				return errors.New("the active harness does not support forward-looking inference changes")
 			}
 		}
 	}
 	if commit == nil {
+		s.mu.Unlock()
 		return errors.New("model configuration commit is unavailable")
 	}
+	// Dispatch snapshots wait for this reservation, but persistence may inspect
+	// supervisor state without running under its mutex.
+	s.inferenceDone = make(chan struct{})
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		close(s.inferenceDone)
+		s.inferenceDone = nil
+		s.mu.Unlock()
+	}()
 	if err := commit(); err != nil {
 		return err
 	}
-	s.config.Model, s.config.Effort, s.config.LegacyEffort, s.config.ServiceMode = selection.Model, selection.Effort, selection.LegacyEffort, selection.ServiceMode
-	if target, ok := s.current.(InferenceDispatcher); ok {
-		target.SetInference(selection)
-	} else if target, ok := s.current.(ModelDispatcher); ok {
-		target.SetModel(selection.Model)
+	if dispatcher, ok := target.(InferenceDispatcher); ok {
+		dispatcher.SetInference(selection)
+	} else if dispatcher, ok := target.(ModelDispatcher); ok {
+		dispatcher.SetModel(selection.Model)
 	}
+	s.mu.Lock()
+	s.config.Model, s.config.Effort, s.config.LegacyEffort, s.config.ServiceMode = selection.Model, selection.Effort, selection.LegacyEffort, selection.ServiceMode
+	s.mu.Unlock()
 	return nil
 }
 
 func (s *Supervisor) Start(ctx context.Context) error {
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
+	if err := s.beginLifecycle(ctx, true); err != nil {
+		return err
+	}
+	defer s.endLifecycle()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return errors.New("harness supervisor is closed")
+		return fmt.Errorf("%w: harness supervisor is closed", ErrProviderUnavailable)
 	}
 	if s.current != nil {
 		s.mu.Unlock()
@@ -140,11 +167,12 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	defer s.mu.Unlock()
 	if err != nil {
 		s.startErr = err
+		s.broadcastReadyLocked()
 		return err
 	}
 	s.current = target
 	s.startErr = nil
-	s.signalReady()
+	s.signalReadyLocked()
 	return nil
 }
 
@@ -163,43 +191,17 @@ func (s *Supervisor) startTarget(ctx context.Context, cfg HarnessConfig) (Harnes
 // Reconfigure validates a new harness by starting it before replacing the old
 // one. This makes configuration transactional from the user's perspective.
 func (s *Supervisor) Reconfigure(cfg HarnessConfig) error {
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
 	s.mu.RLock()
-	if s.closed {
-		s.mu.RUnlock()
-		return errors.New("harness supervisor is closed")
-	}
-	if len(s.active) > 0 {
-		s.mu.RUnlock()
-		return errors.New("cannot change the harness while a harness turn is active; use /stop or wait for completion")
-	}
 	ctx := s.ctx
 	s.mu.RUnlock()
 	if ctx == nil {
-		// The service has not started yet; construction will validate it later.
-		s.mu.Lock()
-		s.config = cfg
-		s.mu.Unlock()
-		return nil
+		ctx = context.Background()
 	}
-
-	target, err := s.startTarget(ctx, cfg)
+	change, err := s.PrepareChange(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	if s.closed || len(s.active) > 0 {
-		s.mu.Unlock()
-		_ = target.Close()
-		return errors.New("harness became busy while applying configuration")
-	}
-	previous := s.current
-	s.current = target
-	s.config = cfg
-	s.startErr = nil
-	s.mu.Unlock()
-	s.signalReady()
+	previous := change.Commit()
 	if previous != nil {
 		_ = previous.Close()
 	}
@@ -211,12 +213,14 @@ func (s *Supervisor) Reconfigure(cfg HarnessConfig) error {
 // intent and remain usable; it never replaces a working harness with a broken
 // selection.
 func (s *Supervisor) ConfigureUnavailable(cfg HarnessConfig, cause error) error {
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
+	if err := s.beginLifecycle(context.Background(), false); err != nil {
+		return err
+	}
+	defer s.endLifecycle()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return errors.New("harness supervisor is closed")
+		return fmt.Errorf("%w: harness supervisor is closed", ErrProviderUnavailable)
 	}
 	if len(s.active) > 0 {
 		return errors.New("cannot change the harness while a harness turn is active; use /stop or wait for completion")
@@ -226,6 +230,7 @@ func (s *Supervisor) ConfigureUnavailable(cfg HarnessConfig, cause error) error 
 	}
 	s.config = cfg
 	s.startErr = cause
+	s.broadcastReadyLocked()
 	return nil
 }
 
@@ -246,20 +251,39 @@ func (s *Supervisor) Available() (bool, string) {
 
 func (s *Supervisor) ReadyEvents() <-chan struct{} { return s.ready }
 
-func (s *Supervisor) signalReady() {
+// Readiness returns a version and a broadcast channel closed on the next
+// lifecycle availability or structural-fence change. Each observer must
+// take a fresh snapshot after waking. ReadyEvents retains its legacy semantics.
+func (s *Supervisor) Readiness() (uint64, <-chan struct{}) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.readyVersion, s.readyChanged
+}
+
+func (s *Supervisor) signalReadyLocked() {
+	s.broadcastReadyLocked()
 	select {
 	case s.ready <- struct{}{}:
 	default:
 	}
 }
 
+func (s *Supervisor) broadcastReadyLocked() {
+	s.readyVersion++
+	close(s.readyChanged)
+	s.readyChanged = make(chan struct{})
+}
+
 func (s *Supervisor) Models(ctx context.Context) ([]Model, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	target, err := s.targetLocked()
+	s.mu.Lock()
+	target, err := s.admissionTargetLocked()
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
+	s.inflight++
+	s.mu.Unlock()
+	defer s.finishOperation()
 	provider, ok := target.(ModelProvider)
 	if !ok {
 		return nil, errors.New("the active harness does not provide a model catalog")
@@ -274,13 +298,16 @@ func (s *Supervisor) target() (Harness, error) {
 }
 
 func (s *Supervisor) targetLocked() (Harness, error) {
+	if s.closed {
+		return nil, fmt.Errorf("%w: harness supervisor is closed", ErrProviderUnavailable)
+	}
 	if s.current != nil {
 		return s.current, nil
 	}
 	if s.startErr != nil {
-		return nil, fmt.Errorf("harness unavailable: %w", s.startErr)
+		return nil, fmt.Errorf("%w: %w", ErrProviderUnavailable, s.startErr)
 	}
-	return nil, errors.New("harness is not started")
+	return nil, fmt.Errorf("%w: harness is not started", ErrProviderUnavailable)
 }
 
 func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
@@ -310,18 +337,42 @@ func (s *Supervisor) ConversationAdmission(key string) string {
 }
 
 func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit core.Emit) (string, bool, error) {
+	for {
+		threadID, steered, err, retry := s.sendAttempt(ctx, key, prompt, message, emit)
+		if !retry {
+			return threadID, steered, err
+		}
+	}
+}
+
+// sendAttempt releases its session lock and inflight count before a failed
+// steer can retry admission, which may wait for a structural fence to settle.
+func (s *Supervisor) sendAttempt(ctx context.Context, key, prompt, message string, emit core.Emit) (threadID string, steered bool, err error, retry bool) {
 	operation := s.controlOperation(key)
-	operation.Lock()
-	// Selecting the target and marking a new turn active must be atomic with
-	// respect to Reconfigure. Otherwise a swap could close the old harness in
-	// the narrow window after target selection but before active bookkeeping.
-	s.mu.Lock()
-	target, err := s.targetLocked()
+	// Never retain the session operation lock while waiting for a lifecycle
+	// barrier: another same-session caller must be able to cancel its wait.
+	for {
+		if err := s.lockDispatch(ctx); err != nil {
+			return "", false, err, false
+		}
+		s.mu.Unlock()
+		operation.Lock()
+		s.mu.Lock()
+		if !s.fenced && s.inferenceDone == nil {
+			break
+		}
+		s.mu.Unlock()
+		operation.Unlock()
+	}
+	// Target selection and active bookkeeping remain atomic with preparation.
+	target, err := s.admissionTargetLocked()
 	if err != nil {
 		s.mu.Unlock()
 		operation.Unlock()
-		return "", false, err
+		return "", false, err, false
 	}
+	s.inflight++
+	defer s.finishOperation()
 	wasActive := target.IsActive(key)
 	selection := inferenceSelection(s.config)
 	logicalActive := s.active[key] > 0
@@ -333,7 +384,7 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 		if emit != nil {
 			emit(core.Event{Kind: core.EventStatus, Text: "Follow-up queued behind the active harness turn", ThreadID: threadID})
 		}
-		return threadID, true, nil
+		return threadID, true, nil, false
 	}
 	if !wasActive {
 		s.active[key] = 1
@@ -341,17 +392,17 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 	wrapper := s.executionEmit(key, target, emit)
 	s.controlEmit[key] = wrapper
 	s.mu.Unlock()
-	threadID, steered, err := sendWithInference(target, ctx, key, prompt, selection, wrapper)
+	threadID, steered, err = sendWithInference(target, ctx, key, prompt, selection, wrapper)
 	if err != nil {
 		if wasActive && steered {
 			// The active turn finished during the failed steering attempt. Retry
 			// as the next ordinary turn instead of losing the follow-up.
 			if !target.IsActive(key) {
 				operation.Unlock()
-				return s.send(ctx, key, prompt, message, emit)
+				return "", false, nil, true
 			}
 			operation.Unlock()
-			return threadID, steered, err
+			return threadID, steered, err, false
 		}
 		if !wasActive {
 			s.mu.Lock()
@@ -361,7 +412,7 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 		}
 	}
 	operation.Unlock()
-	return threadID, steered, err
+	return threadID, steered, err, false
 }
 
 // SendControl delivers guidance to an existing execution without changing its
@@ -371,11 +422,13 @@ func (s *Supervisor) SendControl(ctx context.Context, key string, request Contro
 		return ControlResult{}, errors.New("invalid empty control request")
 	}
 	s.mu.Lock()
-	target, err := s.targetLocked()
+	target, err := s.admissionTargetLocked()
 	if err != nil {
 		s.mu.Unlock()
 		return ControlResult{}, err
 	}
+	s.inflight++
+	defer s.finishOperation()
 	if s.active[key] == 0 || !target.IsActive(key) {
 		s.mu.Unlock()
 		return ControlResult{}, errors.New("job provider turn is no longer active or steerable")
@@ -648,9 +701,15 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 	operation := s.controlOperation(key)
 	operation.Lock()
 	defer operation.Unlock()
-	s.mu.RLock()
+	s.mu.Lock()
 	validStart := !s.closed && s.active[key] > 0 && s.controlGeneration[key] == next.generation
-	s.mu.RUnlock()
+	if validStart {
+		s.inflight++
+	}
+	s.mu.Unlock()
+	if validStart {
+		defer s.finishOperation()
+	}
 	if !validStart {
 		cancelQueuedRequests(next)
 		return
@@ -694,10 +753,12 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 			return
 		}
 	}
-	s.mu.RLock()
+	if err := s.lockDispatch(context.Background()); err != nil {
+		return
+	}
 	validStart = !s.closed && s.active[key] > 0 && s.controlGeneration[key] == next.generation
 	selection := inferenceSelection(s.config)
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	if !validStart {
 		cancelQueuedRequests(next)
 		return
@@ -749,14 +810,27 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 }
 
 func (s *Supervisor) Interrupt(ctx context.Context, key string) (bool, error) {
+	s.mu.RLock()
+	idleFence := s.fenced && len(s.active) == 0
+	s.mu.RUnlock()
+	if idleFence {
+		return false, nil
+	}
 	operation := s.controlOperation(key)
 	operation.Lock()
 	defer operation.Unlock()
-	target, err := s.target()
+	s.mu.Lock()
+	if s.fenced && len(s.active) == 0 {
+		s.mu.Unlock()
+		return false, nil
+	}
+	target, err := s.targetLocked()
 	if err != nil {
+		s.mu.Unlock()
 		return false, err
 	}
-	s.mu.Lock()
+	s.inflight++
+	defer s.finishOperation()
 	logicalActive := s.active[key] > 0
 	generation := s.controlGeneration[key] + 1
 	s.controlGeneration[key] = generation
@@ -789,15 +863,17 @@ func (s *Supervisor) Interrupt(ctx context.Context, key string) (bool, error) {
 }
 
 func (s *Supervisor) ResetSession(key string) error {
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
+	if err := s.beginLifecycle(context.Background(), false); err != nil {
+		return err
+	}
+	defer s.endLifecycle()
 	s.mu.RLock()
 	target := s.current
 	cfg := s.config
 	closed := s.closed
 	s.mu.RUnlock()
 	if closed {
-		return errors.New("harness supervisor is closed")
+		return fmt.Errorf("%w: harness supervisor is closed", ErrProviderUnavailable)
 	}
 	if target != nil {
 		return target.ResetSession(key)
@@ -840,19 +916,45 @@ func (s *Supervisor) HasActiveTurns() bool {
 }
 
 func (s *Supervisor) Close() error {
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
-	s.mu.Lock()
+	var candidate Harness
+	for {
+		s.mu.Lock()
+		if s.prepared != nil {
+			// Preparation has returned (or is about to return). Adopt its
+			// lifecycle reservation instead of depending on caller cleanup.
+			p := s.prepared
+			p.settled = true
+			candidate = p.candidate
+			s.prepared = nil
+			break
+		}
+		if s.lifecycleDone == nil {
+			s.lifecycleDone = make(chan struct{})
+			break
+		}
+		done := s.lifecycleChanged
+		s.mu.Unlock()
+		<-done
+	}
+	// mu and lifecycle ownership are held; no provider I/O runs under mu.
 	if s.closed {
+		s.endLifecycleLocked()
 		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
+	s.fenced = false
 	target := s.current
 	s.current = nil
+	s.broadcastReadyLocked()
 	s.mu.Unlock()
-	if target != nil {
-		return target.Close()
+	defer s.endLifecycle()
+	var candidateErr, targetErr error
+	if candidate != nil {
+		candidateErr = candidate.Close()
 	}
-	return nil
+	if target != nil {
+		targetErr = target.Close()
+	}
+	return errors.Join(candidateErr, targetErr)
 }
