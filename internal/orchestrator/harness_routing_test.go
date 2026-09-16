@@ -130,3 +130,47 @@ func TestHarnessForPhaseFallsBackToLegacyHarness(t *testing.T) {
 		t.Fatal("expected current legacy harness after replacement")
 	}
 }
+
+func TestHarnessForPhaseUsesRuntimeOwnershipTargets(t *testing.T) {
+	registry := harness.NewRegistry()
+	created := 0
+	registry.Register("provider", func(harness.HarnessConfig) (harness.Harness, error) {
+		created++
+		return &roleRoutingHarnessFixture{}, nil
+	})
+	runtime := harness.NewRuntime(registry, harness.HarnessConfig{Name: "provider"})
+	defer runtime.Close()
+	if err := runtime.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Harness: runtime.AcquireRole(harness.RoleChat), HarnessRouter: runtime}
+	target := manager.harnessForPhase(phaseTaskImplementation)
+	if _, _, err := target.Send(context.Background(), "shared", "prompt", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		phase string
+		role  harness.Role
+	}{
+		{phaseTaskImplementation, harness.RoleDeveloper}, {phaseGoalPlanning, harness.RoleDeveloper},
+		{phaseTaskReview, harness.RoleReviewer}, {phaseGoalReview, harness.RoleReviewer},
+		{"notification", harness.RoleNotification}, {"semantic_heartbeat", harness.RoleHeartbeat},
+	} {
+		got := manager.harnessForPhase(test.phase)
+		if got != runtime.AcquireRole(test.role) {
+			t.Fatalf("phase %s bypasses runtime target", test.phase)
+		}
+		if !got.IsActive("shared") {
+			t.Fatalf("phase %s lost shared provider activity", test.phase)
+		}
+		if _, ok := got.(harness.ControlSender); !ok {
+			t.Fatal("control capability lost")
+		}
+		if _, ok := got.(interface{ Close() error }); ok {
+			t.Fatal("role target exposes lifecycle")
+		}
+	}
+	if created != 1 {
+		t.Fatalf("constructed %d providers", created)
+	}
+}

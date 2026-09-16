@@ -98,7 +98,7 @@ func (r *routedHarnessRuntime) compose(cfg config.Config) *harness.RoleSet {
 //
 // The handle resolves the concrete provider only when an operation is
 // admitted, so a caller may safely retain it across live topology changes.
-func (r *routedHarnessRuntime) HarnessForRole(role harness.Role) harness.Harness {
+func (r *routedHarnessRuntime) HarnessForRole(role harness.Role) harness.ExecutionTarget {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -120,13 +120,13 @@ func (r *routedHarnessRuntime) HarnessForRole(role harness.Role) harness.Harness
 
 // targetForRole exposes the current concrete target internally for lifecycle
 // and structural tests. Runtime callers should use HarnessForRole.
-func (r *routedHarnessRuntime) targetForRole(role harness.Role) harness.Harness {
+func (r *routedHarnessRuntime) targetForRole(role harness.Role) harness.ExecutionTarget {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.targetForRoleLocked(role)
 }
 
-func (r *routedHarnessRuntime) targetForRoleLocked(role harness.Role) harness.Harness {
+func (r *routedHarnessRuntime) targetForRoleLocked(role harness.Role) harness.ExecutionTarget {
 	if r.current != nil {
 		if target := r.current.HarnessForRole(role); target != nil {
 			return target

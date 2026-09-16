@@ -23,8 +23,9 @@ func TestRuntimeSingleProviderOwnershipAndCapabilities(t *testing.T) {
 	r := NewRuntime(registry, HarnessConfig{Name: " OLD ", SessionsFile: "one-session-file"})
 	target := r.AcquireRole(RoleChat)
 	for _, role := range []Role{RoleChat, RoleDeveloper, RoleReviewer, RoleNotification, RoleHeartbeat} {
-		if r.AcquireRole(role) != target {
-			t.Fatalf("role %s has a different target", role)
+		roleTarget := r.AcquireRole(role).(*runtimeTarget)
+		if roleTarget.current() != r.supervisor || r.AcquireRole(role) != roleTarget {
+			t.Fatalf("role %s does not retain a stable target for the same provider", role)
 		}
 	}
 	// The wrapper preserves every public operational Supervisor method, while

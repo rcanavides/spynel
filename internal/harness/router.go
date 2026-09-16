@@ -14,7 +14,7 @@ const (
 
 // RoleRouter resolves the harness assigned to a logical agent role.
 type RoleRouter interface {
-	HarnessForRole(Role) Harness
+	HarnessForRole(Role) ExecutionTarget
 }
 
 // StaticRoleRouter provides an immutable role-to-harness mapping with
@@ -43,7 +43,7 @@ func NewStaticRoleRouter(fallback Harness, routes map[Role]Harness) *StaticRoleR
 
 // HarnessForRole returns the explicit harness for role when configured.
 // Otherwise it returns the fallback harness.
-func (r *StaticRoleRouter) HarnessForRole(role Role) Harness {
+func (r *StaticRoleRouter) HarnessForRole(role Role) ExecutionTarget {
 	if r == nil {
 		return nil
 	}

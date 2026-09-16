@@ -50,6 +50,9 @@ func TestServiceSingleProviderRuntimeOwnsLifecycleAndSettings(t *testing.T) {
 	providers := harness.NewRuntime(registry, harness.HarnessConfig{Name: "acp", SessionsFile: cfg.HarnessSessionsPath("acp")})
 	service := NewWithHarnessRuntime(cfg, providers, NewRuntime())
 	defer service.Close()
+	if service.Orchestrator.HarnessRouter != providers {
+		t.Fatal("orchestrator router is not Runtime")
+	}
 	if service.Harness != providers.AcquireRole(harness.RoleChat) || service.Orchestrator.Harness != service.Harness {
 		t.Fatal("service and orchestrator do not share runtime target")
 	}

@@ -135,7 +135,9 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 // NewWithHarnessRuntime gives the service operational access while the provider
 // runtime remains the sole owner of its Supervisor lifecycle.
 func NewWithHarnessRuntime(cfg config.Config, providers *harness.Runtime, runtime *Runtime) *Service {
-	return newWithHarnessOwner(cfg, providers.AcquireRole(harness.RoleChat), providers, runtime)
+	service := newWithHarnessOwner(cfg, providers.AcquireRole(harness.RoleChat), providers, runtime)
+	service.Orchestrator.HarnessRouter = providers
+	return service
 }
 
 func newWithHarnessOwner(cfg config.Config, target harness.ExecutionTarget, owner providerLifecycle, runtime *Runtime) *Service {

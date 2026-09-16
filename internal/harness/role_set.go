@@ -40,7 +40,7 @@ func NewRoleSet(fallback Harness, routes map[Role]Harness, additional ...Harness
 }
 
 // HarnessForRole implements RoleRouter.
-func (s *RoleSet) HarnessForRole(role Role) Harness {
+func (s *RoleSet) HarnessForRole(role Role) ExecutionTarget {
 	if s == nil || s.router == nil {
 		return nil
 	}
