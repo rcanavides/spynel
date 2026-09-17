@@ -1223,29 +1223,11 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	if startupRequested && s.Startup == nil {
 		return nil, errors.New("autostart registration is unavailable")
 	}
-	var roleHarnessReconfigured bool
-	roleReconfigurer, canReconfigureRoles := s.RoleHarnesses.(interface {
-		ReconfigureRoleHarnesses(config.Config) error
-	})
-
-	if primaryHarnessChanged {
+	topologyChanged := primaryHarnessChanged || roleHarnessChanged
+	if topologyChanged {
 		if err := s.reconfigureHarness(next); err != nil {
 			return nil, err
 		}
-	}
-
-	if canReconfigureRoles && roleHarnessChanged {
-		if err := roleReconfigurer.ReconfigureRoleHarnesses(next); err != nil {
-			var rollback error
-			if primaryHarnessChanged {
-				rollback = s.reconfigureHarness(previous)
-			}
-			return nil, errors.Join(
-				err,
-				wrapRollback("primary harness", rollback),
-			)
-		}
-		roleHarnessReconfigured = true
 	}
 	if unchanged && !startupRequested {
 		if themeChanged {
@@ -1268,20 +1250,14 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		err = update()
 	}
 	if err != nil {
-		var roleRollback error
-		if roleHarnessReconfigured {
-			roleRollback = roleReconfigurer.ReconfigureRoleHarnesses(previous)
-		}
-
 		var primaryRollback error
-		if primaryHarnessChanged {
+		if topologyChanged {
 			primaryRollback = s.reconfigureHarness(previous)
 		}
 
 		s.Runtime.LogEvent("error", "config", "persist_failed", "Configuration persistence failed")
 		return nil, errors.Join(
 			err,
-			wrapRollback("role harnesses", roleRollback),
 			wrapRollback("primary harness", primaryRollback),
 		)
 	}
@@ -1547,6 +1523,9 @@ func harnessAgentPolicyChanged(previous, next config.Harness) bool {
 }
 
 func (s *Service) reconfigureHarness(cfg config.Config) error {
+	if s.ReconfigureProviders != nil {
+		return s.ReconfigureProviders(cfg)
+	}
 	runtimeHarness, ok := s.harnessLifecycle.(interface {
 		HarnessConfig() harness.HarnessConfig
 		Reconfigure(harness.HarnessConfig) error

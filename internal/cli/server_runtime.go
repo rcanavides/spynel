@@ -12,7 +12,6 @@ import (
 	"github.com/agent0ai/spynel/internal/channel"
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
-	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/localapi"
 	"github.com/agent0ai/spynel/internal/theme"
@@ -240,15 +239,6 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 }
 
 func runPrimaryOrchestrator(ctx context.Context, service *app.Service) error {
-	if availability, ok := service.Harness.(harness.Availability); ok {
-		if ready, _ := availability.Available(); !ready {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-availability.ReadyEvents():
-			}
-		}
-	}
 	return service.Orchestrator.Run(ctx)
 }
 

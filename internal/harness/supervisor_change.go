@@ -245,3 +245,11 @@ func (p *PreparedChange) Abort() error {
 	s.mu.Unlock()
 	return err
 }
+
+// AdmissionError reports structural availability without admitting provider work.
+func (s *Supervisor) AdmissionError() error {
+	s.mu.RLock()
+	_, err := s.admissionTargetLocked()
+	s.mu.RUnlock()
+	return err
+}

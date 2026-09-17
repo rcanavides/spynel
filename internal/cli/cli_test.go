@@ -1379,9 +1379,6 @@ func TestBuildServiceUsesConfiguredHarnessSandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer service.Close()
-	if service.RoleHarnesses != nil {
-		t.Fatal("single-provider composition attached routed lifecycle")
-	}
 	if _, ok := service.Harness.(interface{ Start(context.Context) error }); ok {
 		t.Fatal("single-provider operational target exposes Start")
 	}
@@ -1768,9 +1765,6 @@ func TestBuildServiceWithoutRoutingKeepsSingleHarness(t *testing.T) {
 	}
 	defer service.Close()
 
-	if service.RoleHarnesses != nil {
-		t.Fatal("legacy single-harness configuration unexpectedly created routed harnesses")
-	}
 }
 
 func TestBuildServiceConstructsUniqueRoutedHarnesses(t *testing.T) {
@@ -1801,19 +1795,12 @@ func TestBuildServiceConstructsUniqueRoutedHarnesses(t *testing.T) {
 	}
 	defer service.Close()
 
-	if service.RoleHarnesses == nil {
-		t.Fatal("routed configuration did not create role harness runtime")
-	}
+	roleRuntime := service.Orchestrator.HarnessRouter
 
-	roleRuntime, ok := service.RoleHarnesses.(*routedHarnessRuntime)
-	if !ok {
-		t.Fatalf("role harness runtime type = %T, want *routedHarnessRuntime", service.RoleHarnesses)
-	}
-
-	developer := roleRuntime.targetForRole(harness.RoleDeveloper)
-	reviewer := roleRuntime.targetForRole(harness.RoleReviewer)
-	heartbeat := roleRuntime.targetForRole(harness.RoleHeartbeat)
-	notification := roleRuntime.targetForRole(harness.RoleNotification)
+	developer := roleRuntime.HarnessForRole(harness.RoleDeveloper)
+	reviewer := roleRuntime.HarnessForRole(harness.RoleReviewer)
+	heartbeat := roleRuntime.HarnessForRole(harness.RoleHeartbeat)
+	notification := roleRuntime.HarnessForRole(harness.RoleNotification)
 
 	if developer == service.Harness {
 		t.Fatal("developer unexpectedly resolved to primary harness")
@@ -1821,10 +1808,10 @@ func TestBuildServiceConstructsUniqueRoutedHarnesses(t *testing.T) {
 	if reviewer == service.Harness {
 		t.Fatal("reviewer unexpectedly resolved to primary harness")
 	}
-	if developer != heartbeat {
+	if targetHarnessConfig(developer).Name != targetHarnessConfig(heartbeat).Name {
 		t.Fatal("roles using the same provider did not share one supervisor")
 	}
-	if notification != service.Harness {
+	if targetHarnessConfig(notification).Name != targetHarnessConfig(service.Harness).Name {
 		t.Fatal("unconfigured notification role did not fall back to primary harness")
 	}
 	if developer == reviewer {
@@ -1906,17 +1893,13 @@ func TestNewRoutedHarnessDoesNotInheritPrimaryInference(t *testing.T) {
 	)
 	defer runtimeState.Close()
 
-	target := newHarnessSupervisor(
-		harness.NewBuiltinRegistry(),
+	runtimeConfig := harnessSupervisorConfig(
 		cfg,
 		"claude-code",
 		"test",
 		runtimeState,
 		false,
 	)
-	defer target.Close()
-
-	runtimeConfig := target.HarnessConfig()
 
 	if runtimeConfig.Name != "claude-code" {
 		t.Fatalf("routed harness name = %q, want claude-code", runtimeConfig.Name)
@@ -1965,33 +1948,30 @@ func TestBuildServiceLiveSandboxPropagatesToRoutedHarnesses(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	primary, ok := service.Harness.(*harness.Supervisor)
+	primary, ok := service.Harness.(interface{ HarnessConfig() harness.HarnessConfig })
 	if !ok {
 		t.Fatalf("primary harness type = %T, want *harness.Supervisor", service.Harness)
 	}
 
-	roleRuntime, ok := service.RoleHarnesses.(*routedHarnessRuntime)
-	if !ok {
-		t.Fatalf("role harness runtime type = %T, want *routedHarnessRuntime", service.RoleHarnesses)
-	}
+	roleRuntime := service.Orchestrator.HarnessRouter
 
-	developer, ok := roleRuntime.targetForRole(harness.RoleDeveloper).(*harness.Supervisor)
+	developer, ok := roleRuntime.HarnessForRole(harness.RoleDeveloper).(interface{ HarnessConfig() harness.HarnessConfig })
 	if !ok {
 		t.Fatalf(
 			"developer harness type = %T, want *harness.Supervisor",
-			roleRuntime.targetForRole(harness.RoleDeveloper),
+			roleRuntime.HarnessForRole(harness.RoleDeveloper),
 		)
 	}
 
-	reviewer, ok := roleRuntime.targetForRole(harness.RoleReviewer).(*harness.Supervisor)
+	reviewer, ok := roleRuntime.HarnessForRole(harness.RoleReviewer).(interface{ HarnessConfig() harness.HarnessConfig })
 	if !ok {
 		t.Fatalf(
 			"reviewer harness type = %T, want *harness.Supervisor",
-			roleRuntime.targetForRole(harness.RoleReviewer),
+			roleRuntime.HarnessForRole(harness.RoleReviewer),
 		)
 	}
 
-	for name, target := range map[string]*harness.Supervisor{
+	for name, target := range map[string]interface{ HarnessConfig() harness.HarnessConfig }{
 		"primary":   primary,
 		"developer": developer,
 		"reviewer":  reviewer,
@@ -2030,12 +2010,9 @@ func TestBuildServiceLivePrimaryChangeReusesPrimaryForMatchingRoute(t *testing.T
 
 	primary := service.Harness
 
-	roleRuntime, ok := service.RoleHarnesses.(*routedHarnessRuntime)
-	if !ok {
-		t.Fatalf("role harness runtime type = %T, want *routedHarnessRuntime", service.RoleHarnesses)
-	}
+	roleRuntime := service.Orchestrator.HarnessRouter
 
-	before := roleRuntime.targetForRole(harness.RoleDeveloper)
+	before := roleRuntime.HarnessForRole(harness.RoleDeveloper)
 	if before == primary {
 		t.Fatal("developer unexpectedly used primary before harness.name changed")
 	}
@@ -2046,188 +2023,11 @@ func TestBuildServiceLivePrimaryChangeReusesPrimaryForMatchingRoute(t *testing.T
 		t.Fatal(err)
 	}
 
-	after := roleRuntime.targetForRole(harness.RoleDeveloper)
-	if after != primary {
+	after := roleRuntime.HarnessForRole(harness.RoleDeveloper)
+	if targetHarnessConfig(after).Name != targetHarnessConfig(primary).Name {
 		t.Fatalf(
 			"developer route still uses stale additional harness %T after primary changed to codex",
 			after,
-		)
-	}
-}
-
-type busyRoutedHarness struct {
-	active bool
-	closed bool
-	sends  int
-}
-
-func (h *busyRoutedHarness) Start(context.Context) error {
-	return nil
-}
-
-func (h *busyRoutedHarness) Send(
-	context.Context,
-	string,
-	string,
-	core.Emit,
-) (string, bool, error) {
-	if h.closed {
-		return "", false, errors.New("harness is closed")
-	}
-	h.sends++
-	h.active = true
-	return "thread-test", false, nil
-}
-
-func (h *busyRoutedHarness) Interrupt(context.Context, string) (bool, error) {
-	return false, nil
-}
-
-func (h *busyRoutedHarness) ResetSession(string) error {
-	return nil
-}
-
-func (h *busyRoutedHarness) ThreadID(string) string {
-	return ""
-}
-
-func (h *busyRoutedHarness) IsActive(string) bool {
-	return h.active
-}
-
-func (h *busyRoutedHarness) HasActiveTurns() bool {
-	return h.active
-}
-
-func (h *busyRoutedHarness) Close() error {
-	h.closed = true
-	return nil
-}
-
-func TestRoutedHarnessRuntimeRejectsLiveReconfigureWhileRoutedTurnActive(t *testing.T) {
-	root := t.TempDir()
-	if err := workspace.Init(root, false); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := config.Load(config.PathForRoot(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	primary := &busyRoutedHarness{}
-	developer := &busyRoutedHarness{active: true}
-
-	current := harness.NewRoleSet(
-		primary,
-		map[harness.Role]harness.Harness{
-			harness.RoleDeveloper: developer,
-		},
-		developer,
-	)
-
-	ctx := context.Background()
-
-	if err := current.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	runtime := &routedHarnessRuntime{
-		registry: harness.NewBuiltinRegistry(),
-		primary:  primary,
-		version:  "test",
-		current:  current,
-		ctx:      ctx,
-		started:  true,
-	}
-
-	// Changing the primary to codex makes the developer route collapse onto
-	// the primary. That topology change must not retire the currently active
-	// routed developer harness.
-	cfg.Harness.Name = "codex"
-	cfg.Harness.Routing = &config.HarnessRouting{
-		Developer: "codex",
-	}
-
-	err = runtime.ReconfigureRoleHarnesses(cfg)
-	if err == nil {
-		t.Fatal("live routed reconfiguration succeeded while developer turn was active")
-	}
-
-	if developer.closed {
-		t.Fatal("active routed developer harness was closed by rejected reconfiguration")
-	}
-
-	if got := runtime.targetForRole(harness.RoleDeveloper); got != developer {
-		t.Fatalf(
-			"developer route changed after rejected reconfiguration: got %T",
-			got,
-		)
-	}
-}
-
-func TestRoutedHarnessRoleHandleDoesNotBecomeStaleAcrossLiveReconfigure(t *testing.T) {
-	primary := &busyRoutedHarness{}
-	developer := &busyRoutedHarness{}
-
-	current := harness.NewRoleSet(
-		primary,
-		map[harness.Role]harness.Harness{
-			harness.RoleDeveloper: developer,
-		},
-		developer,
-	)
-
-	ctx := context.Background()
-
-	if err := current.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	runtime := &routedHarnessRuntime{
-		primary: primary,
-		current: current,
-		ctx:     ctx,
-		started: true,
-	}
-
-	// Simula al orchestrador resolviendo el rol inmediatamente antes de que
-	// otra goroutine confirme una reconfiguración live.
-	handle := runtime.HarnessForRole(harness.RoleDeveloper)
-
-	cfg := config.Config{}
-	cfg.Harness.Name = "codex"
-	cfg.Harness.Routing = &config.HarnessRouting{
-		Developer: "codex",
-	}
-
-	// El developer ahora debe colapsar sobre el primary.
-	if err := runtime.ReconfigureRoleHarnesses(cfg); err != nil {
-		t.Fatal(err)
-	}
-
-	// Un handle obtenido antes del commit no debe quedar apuntando al routed
-	// harness retirado. El envío debe observar la topología vigente.
-	if _, _, err := handle.Send(
-		context.Background(),
-		"race-proof",
-		"test",
-		nil,
-	); err != nil {
-		t.Fatalf("pre-commit role handle became stale after live reconfigure: %v", err)
-	}
-
-	if developer.sends != 0 {
-		t.Fatalf(
-			"retired developer received %d sends after live reconfigure",
-			developer.sends,
-		)
-	}
-
-	if primary.sends != 1 {
-		t.Fatalf(
-			"primary received %d sends after developer route collapsed onto primary, want 1",
-			primary.sends,
 		)
 	}
 }
@@ -2264,21 +2064,15 @@ func TestBuildServiceLiveACPArgsPropagateToRoutedACP(t *testing.T) {
 	}
 	defer service.Close()
 
-	roleRuntime, ok := service.RoleHarnesses.(*routedHarnessRuntime)
-	if !ok {
-		t.Fatalf(
-			"role harness runtime type = %T, want *routedHarnessRuntime",
-			service.RoleHarnesses,
-		)
-	}
+	roleRuntime := service.Orchestrator.HarnessRouter
 
-	before, ok := roleRuntime.targetForRole(
+	before, ok := roleRuntime.HarnessForRole(
 		harness.RoleDeveloper,
-	).(*harness.Supervisor)
+	).(interface{ HarnessConfig() harness.HarnessConfig })
 	if !ok {
 		t.Fatalf(
 			"developer harness type = %T, want *harness.Supervisor",
-			roleRuntime.targetForRole(harness.RoleDeveloper),
+			roleRuntime.HarnessForRole(harness.RoleDeveloper),
 		)
 	}
 
@@ -2292,13 +2086,13 @@ func TestBuildServiceLiveACPArgsPropagateToRoutedACP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	after, ok := roleRuntime.targetForRole(
+	after, ok := roleRuntime.HarnessForRole(
 		harness.RoleDeveloper,
-	).(*harness.Supervisor)
+	).(interface{ HarnessConfig() harness.HarnessConfig })
 	if !ok {
 		t.Fatalf(
 			"developer harness type after change = %T, want *harness.Supervisor",
-			roleRuntime.targetForRole(harness.RoleDeveloper),
+			roleRuntime.HarnessForRole(harness.RoleDeveloper),
 		)
 	}
 
@@ -2308,4 +2102,8 @@ func TestBuildServiceLiveACPArgsPropagateToRoutedACP(t *testing.T) {
 			got,
 		)
 	}
+}
+
+func targetHarnessConfig(target harness.ExecutionTarget) harness.HarnessConfig {
+	return target.(interface{ HarnessConfig() harness.HarnessConfig }).HarnessConfig()
 }

@@ -238,6 +238,23 @@ func (m *Manager) SetNotificationDelivery(deliver func(context.Context, Origin, 
 }
 
 func (m *Manager) Run(ctx context.Context) error {
+	if observer, ok := m.HarnessRouter.(interface {
+		Readiness() (uint64, <-chan struct{})
+	}); ok {
+		_, changed := observer.Readiness()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-changed:
+				}
+				_, changed = observer.Readiness()
+				m.requestScan()
+			}
+		}()
+	}
+
 	if err := m.ScanOnce(ctx); err != nil {
 		m.log("orchestrator scan: " + err.Error())
 	}
@@ -513,7 +530,19 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 	if err != nil {
 		return err
 	}
+	// One reservation is held at a time across iterations: each is released
+	// when the next iteration starts, and the last one by this deferred release.
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
 	for _, entry := range entries {
+		if release != nil {
+			release()
+			release = nil
+		}
 		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") || entry.Name() == "AGENTS.md" {
 			continue
 		}
@@ -571,6 +600,11 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 		if phase == phaseTaskReview {
 			lease.ImplementerThread, _ = document.FrontMatter["implementation_thread"].(string)
 		}
+		_, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(phase), lease.SessionKey)
+		if reserveErr != nil {
+			continue
+		}
+		release = held
 		if err := m.saveLease(lease); err != nil {
 			return err
 		}
@@ -614,6 +648,12 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 }
 
 func (m *Manager) startExistingClaim(ctx context.Context, route workflowRoute, path, phase string, recovery, incrementAttempt bool) error {
+	if a, ok := m.harnessForPhase(phase).(harness.Availability); ok {
+		if ready, _ := a.Available(); !ready {
+			return nil
+		}
+	}
+
 	document, err := ReadDocument(path)
 	if err != nil {
 		return err
@@ -628,6 +668,15 @@ func (m *Manager) startExistingClaim(ctx context.Context, route workflowRoute, p
 	}
 	field := phaseAttemptField(phase)
 	attempt := numberValue(document.FrontMatter[field])
+	nextAttempt := attempt
+	if incrementAttempt || attempt == 0 {
+		nextAttempt++
+	}
+	_, release, reserveErr := harness.ReserveExecution(m.harnessForPhase(phase), phaseSessionKey(route.Name, id, phase, nextAttempt))
+	if reserveErr != nil {
+		return nil
+	}
+	defer release()
 	if incrementAttempt || attempt == 0 {
 		attempt++
 		document.FrontMatter[field] = attempt
@@ -681,9 +730,15 @@ func (m *Manager) ensureRouteDirectories() error {
 }
 
 func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease, recovery bool) {
+	_, release, err := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
+	if err != nil {
+		return
+	}
+
 	m.setInflight(lease.ID, true)
 	m.jobs.Add(1)
 	go func() {
+		defer release()
 		defer m.jobs.Done()
 		defer func() {
 			m.setInflight(lease.ID, false)
@@ -1117,10 +1172,27 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// One reservation is held at a time across iterations: each is released
+	// when the next iteration starts, and the last one by this deferred release.
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
 	for _, lease := range leases {
+		if release != nil {
+			release()
+			release = nil
+		}
 		if lease.State != "claiming" || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
+		_, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
+		if reserveErr != nil {
+			continue
+		}
+		release = held
 		if _, err := os.Stat(lease.File); os.IsNotExist(err) && lease.SourceFile != "" {
 			if _, sourceErr := os.Stat(lease.SourceFile); sourceErr == nil {
 				phase := normalizeLeasePhase(lease.Route, lease.Phase)
@@ -1475,7 +1547,19 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 		return err
 	}
 	now := time.Now()
+	// One reservation is held at a time across iterations: each is released
+	// when the next iteration starts, and the last one by this deferred release.
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
 	for _, lease := range leases {
+		if release != nil {
+			release()
+			release = nil
+		}
 		if lease.State == "hook_cancelled" {
 			continue
 		}
@@ -1493,6 +1577,11 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 		if (!foreignOwner && now.Sub(lease.HeartbeatAt) < route.StaleAfter) || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
+		_, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
+		if reserveErr != nil {
+			continue
+		}
+		release = held
 		lease.OwnerID = m.ownerID
 		lease.HeartbeatAt = time.Now().UTC()
 		if err := m.saveLease(lease); err != nil {
@@ -1909,12 +1998,23 @@ func (m *Manager) isControlCancelled(leaseID string) bool {
 }
 
 func (m *Manager) recordError(lease Lease, err error) {
+	if errors.Is(err, harness.ErrProviderFenced) {
+		m.log(fmt.Sprintf(
+			"dispatch %s deferred by structural fence: %v",
+			lease.File,
+			err,
+		))
+		return
+	}
+
 	lease.LastError = err.Error()
 	lease.State = "error"
 	lease.HeartbeatAt = time.Now().UTC()
+
 	if saveErr := m.saveLease(lease); saveErr != nil {
 		m.log("save failed lease: " + saveErr.Error())
 	}
+
 	m.log(fmt.Sprintf("dispatch %s: %v", lease.File, err))
 }
 
@@ -1979,4 +2079,9 @@ func (m *Manager) log(message string) {
 func leaseID(route, path string) string {
 	hash := sha256.Sum256([]byte(route + "\x00" + filepath.Clean(path)))
 	return hex.EncodeToString(hash[:12])
+}
+
+// ExecutionProvider is process-local admission metadata, never durable lease ownership.
+func (m *Manager) ExecutionProvider(lease Lease) harness.ProviderID {
+	return harness.ExecutionProvider(m.harnessForPhase(lease.Phase), lease.SessionKey)
 }

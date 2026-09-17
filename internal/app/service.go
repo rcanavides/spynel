@@ -30,16 +30,7 @@ import (
 	"github.com/agent0ai/spynel/internal/updater"
 )
 
-// RoleHarnessRuntime owns additional role-specific harnesses while the
-// ordinary Service.Harness remains the communication/chat harness.
-type RoleHarnessRuntime interface {
-	harness.RoleRouter
-	Start(context.Context) error
-	Close() error
-}
-
-// providerLifecycle selects one owner per service composition. The single-provider
-// path uses harness.Runtime; the legacy routed path retains its primary owner.
+// providerLifecycle is owned by Runtime in production; fixtures may inject a harness.
 type providerLifecycle interface {
 	Start(context.Context) error
 	Close() error
@@ -49,17 +40,17 @@ type Service struct {
 	// Config is the immutable structural configuration used to construct
 	// histories, hooks, routes, and workspace paths. Live scalar values are
 	// always read through Settings, avoiding races with remote form commands.
-	Config           config.Config
-	Harness          harness.ExecutionTarget
-	harnessLifecycle providerLifecycle
-	RoleHarnesses    RoleHarnessRuntime
-	History          *history.Store
-	Hooks            extensions.Runner
-	Orchestrator     *orchestrator.Manager
-	Runtime          *Runtime
-	Settings         *config.Store
-	PairingControl   channel.PairingManager
-	DeliveryControl  channel.DeliveryRouter
+	Config               config.Config
+	Harness              harness.ExecutionTarget
+	harnessLifecycle     providerLifecycle
+	ReconfigureProviders func(config.Config) error
+	History              *history.Store
+	Hooks                extensions.Runner
+	Orchestrator         *orchestrator.Manager
+	Runtime              *Runtime
+	Settings             *config.Store
+	PairingControl       channel.PairingManager
+	DeliveryControl      channel.DeliveryRouter
 	// ConversationDelivery is the ordinary channel response path used by
 	// communication recovery; it is intentionally separate from Notify.
 	ConversationDelivery   channel.DeliveryRouter
@@ -126,8 +117,8 @@ func New(cfg config.Config, target harness.Harness) *Service {
 	return NewWithRuntime(cfg, target, NewRuntime())
 }
 
-// NewWithRuntime retains legacy injected-harness ownership for routed composition
-// and fixtures. Single-provider production composition uses NewWithHarnessRuntime.
+// NewWithRuntime retains injected-harness ownership for fixtures.
+// Production composition uses NewWithHarnessRuntime.
 func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime) *Service {
 	return newWithHarnessOwner(cfg, target, target, runtime)
 }
@@ -209,7 +200,7 @@ func newWithHarnessOwner(cfg config.Config, target harness.ExecutionTarget, owne
 		id, err := runtime.TryBeginJobWithDetails(lease.SessionKey, "orchestrator", "markdown", description, JobDetails{
 			Kind: kind, Route: lease.Route, DurableFile: lease.File,
 			FirstAssignedAt: firstAssignedAt, ProviderIterations: providerIterations, ImplementationAttempts: implementationAttempts,
-			Provider: service.Settings.Snapshot().Harness.Name, WorkID: workID, ParentID: parentID, Phase: lease.Phase, PhaseAttempt: lease.ClaimAttempt,
+			Provider: string(manager.ExecutionProvider(lease)), WorkID: workID, ParentID: parentID, Phase: lease.Phase, PhaseAttempt: lease.ClaimAttempt,
 		})
 		if err != nil {
 			return 0, err
@@ -230,17 +221,7 @@ func newWithHarnessOwner(cfg config.Config, target harness.ExecutionTarget, owne
 	return service
 }
 
-// SetRoleHarnessRuntime attaches additional role-specific harnesses to the
-// service and exposes the same provider-neutral router to the orchestrator.
-func (s *Service) SetRoleHarnessRuntime(runtime RoleHarnessRuntime) {
-	s.RoleHarnesses = runtime
-	if s.Orchestrator != nil {
-		s.Orchestrator.HarnessRouter = runtime
-	}
-}
-
-// ClosePrimaryHarness stops the primary provider through its lifecycle owner.
-// The routed legacy composition continues to close additional providers separately.
+// ClosePrimaryHarness closes all providers through their sole lifecycle owner.
 func (s *Service) ClosePrimaryHarness() error { return s.harnessLifecycle.Close() }
 
 // Close stops the harness while its final diagnostics can still be captured,
@@ -248,15 +229,10 @@ func (s *Service) ClosePrimaryHarness() error { return s.harnessLifecycle.Close(
 func (s *Service) Close() error {
 	s.stopRecoveryScanner()
 
-	var routedErr error
-	if s.RoleHarnesses != nil {
-		routedErr = s.RoleHarnesses.Close()
-	}
-
 	harnessErr := s.ClosePrimaryHarness()
 	s.stopAllChatActivity()
 	s.Runtime.Close()
-	return errors.Join(routedErr, harnessErr)
+	return harnessErr
 }
 
 func (s *Service) validateOrigin(origin orchestrator.Origin) error {
@@ -453,12 +429,6 @@ func (s *Service) Start(ctx context.Context) error {
 
 	if err := s.harnessLifecycle.Start(ctx); err != nil {
 		startErrors = append(startErrors, err)
-	}
-
-	if s.RoleHarnesses != nil {
-		if err := s.RoleHarnesses.Start(ctx); err != nil {
-			startErrors = append(startErrors, fmt.Errorf("start routed harnesses: %w", err))
-		}
 	}
 
 	s.recoveryMu.Lock()
@@ -675,7 +645,12 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	}
 	prompt = preparedPrompt
 	key := sessionKey(message)
-	jobID, jobCreated, err := s.Runtime.tryBeginJobWithDetails(key, message.Channel, message.Conversation, message.Text, JobDetails{Kind: "conversation", Provider: s.Settings.Snapshot().Harness.Name})
+	provider, release, err := harness.ReserveExecutionWait(ctx, s.Harness, key)
+	if err != nil {
+		return err
+	}
+	defer release()
+	jobID, jobCreated, err := s.Runtime.tryBeginJobWithDetails(key, message.Channel, message.Conversation, message.Text, JobDetails{Kind: "conversation", Provider: string(provider)})
 	if err != nil {
 		return fmt.Errorf("start job: %w", err)
 	}

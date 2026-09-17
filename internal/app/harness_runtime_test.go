@@ -2,9 +2,12 @@ package app
 
 import (
 	"context"
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/orchestrator"
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/harness"
@@ -100,5 +103,89 @@ func TestServiceSingleProviderRuntimeOwnsLifecycleAndSettings(t *testing.T) {
 	}
 	if targets[1].closes.Load() != 1 {
 		t.Fatalf("provider closed %d times", targets[1].closes.Load())
+	}
+}
+
+func TestRuntimeJobsAttributeExactAdmittedProvider(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "agent-zero"
+	registry := harness.NewRegistry()
+	spec := harness.RuntimeSpec{Providers: map[harness.ProviderID]harness.HarnessConfig{}, Roles: map[harness.Role]harness.ProviderID{harness.RoleChat: "agent-zero", harness.RoleDeveloper: "codex", harness.RoleReviewer: "claude-code"}}
+	for _, id := range []harness.ProviderID{"agent-zero", "codex", "claude-code"} {
+		target := newHeldServiceHarness()
+		registry.Register(string(id), func(harness.HarnessConfig) (harness.Harness, error) { return target, nil })
+		spec.Providers[id] = harness.HarnessConfig{Name: string(id)}
+	}
+	providers, err := harness.NewRuntimeSpec(registry, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewWithHarnessRuntime(cfg, providers, NewRuntime())
+	defer service.Close()
+	if err = service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		role        harness.Role
+		phase, want string
+	}{{harness.RoleDeveloper, "task_implementation", "codex"}, {harness.RoleReviewer, "task_review", "claude-code"}, {harness.RoleNotification, "notification", "agent-zero"}, {harness.RoleHeartbeat, "semantic_heartbeat", "agent-zero"}} {
+		key := "job:" + test.phase
+		target := providers.AcquireRole(test.role)
+		_, release, e := harness.ReserveExecution(target, key)
+		if e != nil {
+			t.Fatal(e)
+		}
+		// Remap between admission and job creation. The reservation is authoritative.
+		saved := spec.Roles[test.role]
+		spec.Roles[test.role] = "agent-zero"
+		if e = providers.Reconcile(context.Background(), spec); e != nil {
+			t.Fatal(e)
+		}
+		id, e := service.Orchestrator.JobStarted(orchestrator.Lease{SessionKey: key, Phase: test.phase}, "job", time.Time{}, 1, 0)
+		if e != nil {
+			t.Fatal(e)
+		}
+		job, ok := service.Runtime.Job(id)
+		if !ok || job.Provider != test.want {
+			t.Fatalf("phase %s provider=%q want=%q", test.phase, job.Provider, test.want)
+		}
+		if _, _, e = target.Send(context.Background(), key, "prompt", nil); e != nil {
+			t.Fatal(e)
+		}
+		release()
+		if got := harness.ExecutionProvider(target, key); string(got) != job.Provider {
+			t.Fatalf("job=%s actual=%s", job.Provider, got)
+		}
+		if saved == "" {
+			delete(spec.Roles, test.role)
+		} else {
+			spec.Roles[test.role] = saved
+		}
+		if e = providers.Reconcile(context.Background(), spec); e != nil {
+			t.Fatal(e)
+		}
+	}
+	message := core.Message{Channel: "cli", Conversation: "provider", Text: "hello"}
+	if err = service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, job := range service.Runtime.Jobs() {
+		if job.Kind == "conversation" {
+			found = true
+			if job.Provider != "agent-zero" {
+				t.Fatal("chat attributed to ", job.Provider)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("chat job missing")
 	}
 }

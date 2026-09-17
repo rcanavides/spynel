@@ -56,20 +56,16 @@ func TestServiceOwnsRoutedHarnessLifecycle(t *testing.T) {
 	primary := &lifecycleHarness{}
 	developer := &lifecycleHarness{}
 
-	service := New(cfg, primary)
-
-	roleSet := harness.NewRoleSet(
-		primary,
-		map[harness.Role]harness.Harness{
-			harness.RoleDeveloper: developer,
-		},
-		developer,
-	)
-
-	service.SetRoleHarnessRuntime(roleSet)
-
-	if service.Orchestrator.HarnessRouter != roleSet {
-		t.Fatal("role router was not attached to orchestrator")
+	registry := harness.NewRegistry()
+	registry.Register("chat", func(harness.HarnessConfig) (harness.Harness, error) { return primary, nil })
+	registry.Register("developer", func(harness.HarnessConfig) (harness.Harness, error) { return developer, nil })
+	providers, err := harness.NewRuntimeSpec(registry, harness.RuntimeSpec{Providers: map[harness.ProviderID]harness.HarnessConfig{"chat": {Name: "chat"}, "developer": {Name: "developer"}}, Roles: map[harness.Role]harness.ProviderID{harness.RoleChat: "chat", harness.RoleDeveloper: "developer"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewWithHarnessRuntime(cfg, providers, NewRuntime())
+	if service.Orchestrator.HarnessRouter != providers {
+		t.Fatal("different topology owner")
 	}
 
 	if err := service.Start(context.Background()); err != nil {
@@ -81,10 +77,6 @@ func TestServiceOwnsRoutedHarnessLifecycle(t *testing.T) {
 	}
 	if developer.starts != 1 {
 		t.Fatalf("developer starts = %d, want 1", developer.starts)
-	}
-
-	if got := service.Orchestrator.HarnessRouter.HarnessForRole(harness.RoleDeveloper); got != developer {
-		t.Fatal("developer role did not resolve to routed harness")
 	}
 
 	if err := service.Close(); err != nil {

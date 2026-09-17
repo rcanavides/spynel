@@ -18,15 +18,22 @@ type ExecutionTarget interface {
 	IsActive(string) bool
 }
 
-// Runtime owns one stable Supervisor. All roles currently share that provider.
-// It deliberately has no configurable role topology.
+// Runtime exclusively owns every provider and its stable operational role targets.
+// Lifecycle reservations serialize topology work without holding mu over I/O.
 type Runtime struct {
-	supervisor *Supervisor
+	registry   *Registry
+	supervisor *Supervisor // current chat provider; compatibility for local fixtures
 	mu         sync.Mutex
-	roles      map[Role]supervisorOperations // production has only the chat fallback; tests can remap
+	providers  map[ProviderID]*providerEntry
+	roles      map[Role]supervisorOperations
 	targets    map[Role]*runtimeTarget
 	bindings   map[string]*binding
 	closed     bool
+	lifecycle  chan struct{}
+	ctx        context.Context
+	changed    chan struct{}
+	ready      chan struct{}
+	version    uint64
 }
 
 // A binding retains the actual provider Supervisor, rather than re-resolving a
@@ -62,8 +69,11 @@ type runtimeTarget struct {
 
 func NewRuntime(registry *Registry, cfg HarnessConfig) *Runtime {
 	cfg.Name = strings.ToLower(strings.TrimSpace(cfg.Name))
-	s := NewSupervisor(registry, cfg)
-	return &Runtime{supervisor: s, roles: map[Role]supervisorOperations{RoleChat: s}, targets: make(map[Role]*runtimeTarget), bindings: make(map[string]*binding)}
+	r, err := NewRuntimeSpec(registry, RuntimeSpec{Providers: map[ProviderID]HarnessConfig{ProviderID(cfg.Name): cfg}, Roles: map[Role]ProviderID{RoleChat: ProviderID(cfg.Name)}})
+	if err != nil {
+		panic(err)
+	}
+	return r
 }
 func (r *Runtime) AcquireRole(role Role) ExecutionTarget {
 	r.mu.Lock()
@@ -76,26 +86,25 @@ func (r *Runtime) AcquireRole(role Role) ExecutionTarget {
 	return target
 }
 func (r *Runtime) HarnessForRole(role Role) ExecutionTarget { return r.AcquireRole(role) }
-func (r *Runtime) Start(ctx context.Context) error          { return r.supervisor.Start(ctx) }
-func (r *Runtime) Close() error {
-	r.mu.Lock()
-	r.closed = true
-	clear(r.bindings)
-	r.mu.Unlock()
-	return r.supervisor.Close()
+func (r *Runtime) Available() (bool, string) {
+	return r.AcquireRole(RoleChat).(Availability).Available()
 }
-func (r *Runtime) Available() (bool, string)            { return r.supervisor.Available() }
-func (r *Runtime) ReadyEvents() <-chan struct{}         { return r.supervisor.ReadyEvents() }
-func (r *Runtime) Readiness() (uint64, <-chan struct{}) { return r.supervisor.Readiness() }
-func (r *Runtime) HarnessConfig() HarnessConfig         { return r.supervisor.HarnessConfig() }
-
-// Reconfigure preserves the existing publication and retirement boundary.
-// Settings persistence/rollback remains owned by the application transaction.
+func (r *Runtime) ReadyEvents() <-chan struct{} { return r.ready }
+func (r *Runtime) Readiness() (uint64, <-chan struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.version, r.changed
+}
+func (r *Runtime) HarnessConfig() HarnessConfig {
+	return r.AcquireRole(RoleChat).(*runtimeTarget).HarnessConfig()
+}
 func (r *Runtime) Reconfigure(cfg HarnessConfig) error {
 	cfg.Name = strings.ToLower(strings.TrimSpace(cfg.Name))
-	return r.supervisor.Reconfigure(cfg)
+	return r.Reconcile(context.Background(), RuntimeSpec{Providers: map[ProviderID]HarnessConfig{ProviderID(cfg.Name): cfg}, Roles: map[Role]ProviderID{RoleChat: ProviderID(cfg.Name)}})
 }
 func (r *Runtime) ConfigureUnavailable(cfg HarnessConfig, cause error) error {
-	cfg.Name = strings.ToLower(strings.TrimSpace(cfg.Name))
-	return r.supervisor.ConfigureUnavailable(cfg, cause)
+	if ok, _ := r.Available(); ok {
+		return cause
+	}
+	return r.Reconfigure(cfg)
 }

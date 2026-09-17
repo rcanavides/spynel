@@ -383,11 +383,11 @@ func TestRuntimeNonKeyCapabilitiesUseCurrentRoleUnlocked(t *testing.T) {
 	if ready, _ := target.Available(); !ready {
 		t.Fatal("current provider unavailable")
 	}
-	if target.ReadyEvents() != bs.ReadyEvents() {
+	if target.ReadyEvents() != r.ReadyEvents() {
 		t.Fatal("wrong readiness provider")
 	}
 	v, ch := target.Readiness()
-	wantV, wantCh := bs.Readiness()
+	wantV, wantCh := r.Readiness()
 	if v != wantV || ch != wantCh {
 		t.Fatal("broadcast readiness not forwarded")
 	}

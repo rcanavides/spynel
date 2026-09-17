@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/harness"
 )
 
 type ordinaryAgentResult struct {
@@ -19,6 +20,11 @@ type ordinaryAgentResult struct {
 // dispatch through the first authoritative terminal event. Harness Send is an
 // admission boundary for asynchronous adapters such as Codex, not completion.
 func (m *Manager) runOrdinaryAgentTurn(parent context.Context, lease Lease, description, prompt string, timeout time.Duration, providerIterations int) ordinaryAgentResult {
+	_, release, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
+	if reserveErr != nil {
+		return ordinaryAgentResult{err: reserveErr}
+	}
+	defer release()
 	jobID := 0
 	if m.JobStarted != nil {
 		var err error

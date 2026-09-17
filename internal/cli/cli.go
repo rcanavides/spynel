@@ -1115,10 +1115,6 @@ func writeCLIEvent(output io.Writer, streamed *strings.Builder, event core.Event
 	return false, nil
 }
 
-func newHarnessSupervisor(registry *harness.Registry, cfg config.Config, name, version string, runtimeState *app.Runtime, primary bool) *harness.Supervisor {
-	return harness.NewSupervisor(registry, harnessSupervisorConfig(cfg, name, version, runtimeState, primary))
-}
-
 func harnessSupervisorConfig(
 	cfg config.Config,
 	name string,
@@ -1170,6 +1166,24 @@ func harnessSupervisorConfig(
 	return runtimeConfig
 }
 
+func harnessRuntimeSpec(cfg config.Config, version string, runtimeState *app.Runtime) harness.RuntimeSpec {
+	primary := strings.ToLower(strings.TrimSpace(cfg.Harness.Name))
+	spec := harness.RuntimeSpec{Providers: make(map[harness.ProviderID]harness.HarnessConfig), Roles: map[harness.Role]harness.ProviderID{harness.RoleChat: harness.ProviderID(primary)}}
+	spec.Providers[harness.ProviderID(primary)] = harnessSupervisorConfig(cfg, primary, version, runtimeState, true)
+	for _, role := range []harness.Role{harness.RoleDeveloper, harness.RoleReviewer, harness.RoleNotification, harness.RoleHeartbeat} {
+		name := strings.ToLower(strings.TrimSpace(cfg.Harness.NameForRole(role)))
+		if name == "" {
+			name = primary
+		}
+		id := harness.ProviderID(name)
+		spec.Roles[role] = id
+		if _, ok := spec.Providers[id]; !ok {
+			spec.Providers[id] = harnessSupervisorConfig(cfg, name, version, runtimeState, false)
+		}
+	}
+	return spec
+}
+
 func buildService(cfg config.Config, version string) (*app.Service, error) {
 	if err := workspace.Upgrade(cfg.Root); err != nil {
 		return nil, fmt.Errorf("upgrade Spynel workspace: %w", err)
@@ -1182,15 +1196,14 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 
 	registry := harness.NewBuiltinRegistry()
 
-	var service *app.Service
-	if cfg.Harness.RoleRoutingEnabled() {
-		// Keep the old routed composition isolated until its topology migration.
-		primary := newHarnessSupervisor(registry, cfg, cfg.Harness.Name, version, runtimeState, true)
-		service = app.NewWithRuntime(cfg, primary, runtimeState)
-		service.SetRoleHarnessRuntime(newRoutedHarnessRuntime(primary, registry, cfg, version, runtimeState))
-	} else {
-		providers := harness.NewRuntime(registry, harnessSupervisorConfig(cfg, cfg.Harness.Name, version, runtimeState, true))
-		service = app.NewWithHarnessRuntime(cfg, providers, runtimeState)
+	providers, err := harness.NewRuntimeSpec(registry, harnessRuntimeSpec(cfg, version, runtimeState))
+	if err != nil {
+		runtimeState.Close()
+		return nil, err
+	}
+	service := app.NewWithHarnessRuntime(cfg, providers, runtimeState)
+	service.ReconfigureProviders = func(next config.Config) error {
+		return providers.Reconcile(context.Background(), harnessRuntimeSpec(next, version, runtimeState))
 	}
 
 	service.Updates = updater.Detect(version)
