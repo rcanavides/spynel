@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -488,5 +489,265 @@ func TestValidateRequiresACPCommandForRoutedACP(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "harness.acp_command") {
 		t.Fatalf("validation error = %q, want harness.acp_command", err)
+	}
+}
+
+func TestProviderProfilesDecodeNormalizeAndRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	data := []byte(`version: 1
+harness:
+  name: agent-zero
+  providers:
+    Claude-Arch:
+      harness: claude-code
+      model: Model A
+      reasoning_effort: high
+      sandbox: read-only
+    CODEX-DEV:
+      harness: Codex
+      reasoning_effort: Inherit
+      service_mode: priority
+      sandbox: workspace-write
+    ACP-Runner:
+      harness: acp
+      acp_command: fixture-agent
+      acp_args: ["--stdio", "value with spaces"]
+`)
+	path := writeTestConfig(t, root, data)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles := cfg.Harness.Providers
+	if len(profiles) != 3 {
+		t.Fatalf("provider profiles = %#v", profiles)
+	}
+	if _, ok := profiles["Claude-Arch"]; ok {
+		t.Fatal("raw profile key survived normalization")
+	}
+	arch := profiles["claude-arch"]
+	if arch.Harness != "claude-code" || arch.Model != "Model A" || arch.ReasoningEffort != "high" || arch.Sandbox != "read-only" {
+		t.Fatalf("claude-arch profile = %#v", arch)
+	}
+	dev := profiles["codex-dev"]
+	if dev.Harness != "codex" || dev.ReasoningEffort != "" || dev.ServiceMode != "priority" || dev.Sandbox != "workspace-write" {
+		t.Fatalf("codex-dev profile = %#v", dev)
+	}
+	runner := profiles["acp-runner"]
+	if runner.Harness != "acp" || runner.ACPCommand != "fixture-agent" || len(runner.ACPArgs) != 2 || runner.ACPArgs[1] != "value with spaces" {
+		t.Fatalf("acp-runner profile = %#v", runner)
+	}
+	if err := Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reloaded.Harness.Providers, profiles) {
+		t.Fatalf("round trip lost profile values:\ngot  %#v\nwant %#v", reloaded.Harness.Providers, profiles)
+	}
+}
+
+func TestProviderProfilesValidation(t *testing.T) {
+	accept := func(t *testing.T, name string, providers map[string]ProviderProfile) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Harness.Name = "agent-zero"
+			cfg.Harness.Providers = providers
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("valid provider profiles rejected: %v", err)
+			}
+		})
+	}
+	// Unused profiles are accepted: they may be declared now and routed later.
+	accept(t, "unused same-kind profiles", map[string]ProviderProfile{
+		"claude-arch": {Harness: "claude-code", ReasoningEffort: "high", Sandbox: "read-only"},
+		"claude-rev":  {Harness: "claude-code", ReasoningEffort: "high", Sandbox: "read-only"},
+	})
+	accept(t, "inherited profile defaults", map[string]ProviderProfile{
+		"glm-dev": {Harness: "pi"},
+	})
+	accept(t, "acp profile with command", map[string]ProviderProfile{
+		"acp-runner": {Harness: "acp", ACPCommand: "fixture-agent", ACPArgs: []string{"--stdio"}},
+	})
+	accept(t, "codex service mode", map[string]ProviderProfile{
+		"codex-prod": {Harness: "codex", ServiceMode: "priority"},
+	})
+
+	rejections := []struct {
+		name    string
+		prepare func(h *Harness)
+		want    string
+	}{
+		{name: "empty harness", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-dev": {}}
+		}, want: "harness.providers.glm-dev.harness is required"},
+		{name: "unknown harness", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-dev": {Harness: "not-a-harness"}}
+		}, want: "harness.providers.glm-dev.harness is not a supported coding harness"},
+		{name: "empty identity", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"": {Harness: "codex"}}
+		}, want: "must be a non-empty lowercase instance identity"},
+		{name: "whitespace identity", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"   ": {Harness: "codex"}}
+		}, want: "must be a non-empty lowercase instance identity"},
+		{name: "uppercase identity", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"Claude-Arch": {Harness: "codex"}}
+		}, want: "must be a non-empty lowercase instance identity"},
+		{name: "path separator identity", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"claude-arch/escape": {Harness: "codex"}}
+		}, want: "must be a non-empty lowercase instance identity"},
+		{name: "dot identity", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{".": {Harness: "codex"}}
+		}, want: "must be a non-empty lowercase instance identity"},
+		{name: "dotdot identity", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"..": {Harness: "codex"}}
+		}, want: "must be a non-empty lowercase instance identity"},
+		{name: "overlong identity", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{strings.Repeat("a", 64): {Harness: "codex"}}
+		}, want: "must be a non-empty lowercase instance identity"},
+		{name: "reserved codex kind", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"codex": {Harness: "codex"}}
+		}, want: "is reserved by a built-in harness kind"},
+		{name: "reserved claude-code kind", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"claude-code": {Harness: "claude-code"}}
+		}, want: "is reserved by a built-in harness kind"},
+		{name: "reserved agent-zero kind", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"agent-zero": {Harness: "agent-zero"}}
+		}, want: "is reserved by a built-in harness kind"},
+		{name: "reserved acp kind", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"acp": {Harness: "acp", ACPCommand: "fixture"}}
+		}, want: "is reserved by a built-in harness kind"},
+		{name: "invalid reasoning effort", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-dev": {Harness: "claude-code", ReasoningEffort: "two words"}}
+		}, want: "harness.providers.glm-dev.reasoning_effort must be inherit"},
+		{name: "acp reasoning effort", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-acp": {Harness: "acp", ReasoningEffort: "high", ACPCommand: "fixture"}}
+		}, want: "reasoning_effort is not supported for ACP harnesses"},
+		{name: "agent-zero reasoning effort", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-zero": {Harness: "agent-zero", ReasoningEffort: "high"}}
+		}, want: "reasoning_effort is not supported for ACP harnesses"},
+		{name: "service mode on unsupported kind", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-dev": {Harness: "claude-code", ServiceMode: "priority"}}
+		}, want: "service_mode is not supported for claude-code"},
+		{name: "invalid sandbox", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-dev": {Harness: "claude-code", Sandbox: "full-access"}}
+		}, want: "sandbox must be empty (inherit), read-only, workspace-write, or danger-full-access"},
+		{name: "literal inherit sandbox", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-dev": {Harness: "claude-code", Sandbox: "inherit"}}
+		}, want: "sandbox must be empty (inherit), read-only, workspace-write, or danger-full-access"},
+		{name: "acp profile without acp_command", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-acp": {Harness: "acp"}}
+		}, want: "acp_command is required"},
+		{name: "non-acp profile with acp_command", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-dev": {Harness: "claude-code", ACPCommand: "fixture"}}
+		}, want: "acp_command is only supported"},
+		{name: "non-acp profile with acp_args", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-dev": {Harness: "claude-code", ACPArgs: []string{"--stdio"}}}
+		}, want: "acp_args is only supported"},
+		{name: "invalid acp args NUL", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-acp": {Harness: "acp", ACPCommand: "fixture", ACPArgs: []string{"bad\x00argument"}}}
+		}, want: "NUL"},
+		{name: "invalid acp args UTF-8", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-acp": {Harness: "acp", ACPCommand: "fixture", ACPArgs: []string{"\xff"}}}
+		}, want: "invalid UTF-8"},
+		{name: "invalid acp args multiline", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-acp": {Harness: "acp", ACPCommand: "fixture", ACPArgs: []string{"line\nbreak"}}}
+		}, want: "multiline"},
+		{name: "invalid model line", prepare: func(h *Harness) {
+			h.Providers = map[string]ProviderProfile{"glm-dev": {Harness: "claude-code", Model: strings.Repeat("m", 1025)}}
+		}, want: "model must be one line of at most 1024 bytes"},
+	}
+	for _, test := range rejections {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Harness.Name = "agent-zero"
+			test.prepare(&cfg.Harness)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+
+	// Distinct raw keys that normalize to one identity are rejected on load.
+	root := t.TempDir()
+	path := writeTestConfig(t, root, []byte("version: 1\nharness:\n  name: agent-zero\n  providers:\n    Claude-Arch:\n      harness: claude-code\n    claude-arch:\n      harness: claude-code\n"))
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "normalize to the same provider identity") {
+		t.Fatalf("duplicate normalized identity = %v", err)
+	}
+}
+
+// A literal `sandbox: inherit` value is rejected: only the empty value means
+// inheritance, and the validation message must not present "inherit" as a
+// valid literal value.
+func TestProviderProfileLiteralInheritSandboxRejected(t *testing.T) {
+	root := t.TempDir()
+	path := writeTestConfig(t, root, []byte("version: 1\nharness:\n  name: agent-zero\n  providers:\n    glm-dev:\n      harness: claude-code\n      sandbox: inherit\n"))
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("provider profile sandbox inherit was accepted")
+	}
+	if !strings.Contains(err.Error(), "harness.providers.glm-dev.sandbox must be empty (inherit), read-only, workspace-write, or danger-full-access") {
+		t.Fatalf("validation error = %q", err)
+	}
+	if strings.Contains(err.Error(), "must be inherit,") {
+		t.Fatalf("validation error presents inherit as a valid literal value: %q", err)
+	}
+}
+
+func TestProviderSessionsPath(t *testing.T) {
+	root := t.TempDir()
+	cfg := Default()
+	cfg.Root = root
+	cfg.Path = PathForRoot(root)
+
+	legacy := ProviderRef{ID: "claude-code", Kind: "claude-code"}
+	if got, want := cfg.ProviderSessionsPath(legacy), cfg.HarnessSessionsPath("claude-code"); got != want {
+		t.Fatalf("legacy provider session path = %q, want %q", got, want)
+	}
+
+	arch := ProviderRef{ID: "claude-arch", Kind: "claude-code", Profile: &ProviderProfile{Harness: "claude-code"}}
+	rev := ProviderRef{ID: "claude-rev", Kind: "claude-code", Profile: &ProviderProfile{Harness: "claude-code"}}
+	archPath := cfg.ProviderSessionsPath(arch)
+	revPath := cfg.ProviderSessionsPath(rev)
+	wantArch := filepath.Join(root, ".spynel", "runtime", "providers", "claude-arch", "harness-claude-code-sessions.json")
+	wantRev := filepath.Join(root, ".spynel", "runtime", "providers", "claude-rev", "harness-claude-code-sessions.json")
+	if archPath != wantArch || revPath != wantRev {
+		t.Fatalf("profile session paths = %q and %q", archPath, revPath)
+	}
+	if archPath == revPath || filepath.Dir(archPath) == filepath.Dir(revPath) {
+		t.Fatal("same-kind instances share a session directory")
+	}
+	if archPath == cfg.ProviderSessionsPath(legacy) {
+		t.Fatal("profile session path overlaps the legacy path")
+	}
+	providersRoot := filepath.Join(root, ".spynel", "runtime", "providers")
+	if !strings.HasPrefix(archPath, providersRoot+string(os.PathSeparator)) {
+		t.Fatalf("profile session path escapes the providers directory: %q", archPath)
+	}
+
+	// A kind change moves the instance's session filename.
+	piRef := ProviderRef{ID: "claude-arch", Kind: "pi", Profile: &ProviderProfile{Harness: "pi"}}
+	if got := cfg.ProviderSessionsPath(piRef); got == archPath || !strings.HasSuffix(got, "harness-pi-sessions.json") {
+		t.Fatalf("kind change did not move the session file: %q", got)
+	}
+
+	// Valid normalized identities have no traversal opportunity, and even
+	// hostile directly-constructed references stay inside the providers
+	// directory.
+	for _, id := range []string{"claude-arch", "a", "z9", "glm_dev", strings.Repeat("x", 63), "../escape", "nested/id", "back\\slash", ".."} {
+		ref := ProviderRef{ID: id, Kind: "codex", Profile: &ProviderProfile{Harness: "codex"}}
+		path := cfg.ProviderSessionsPath(ref)
+		clean := filepath.Clean(path)
+		for _, part := range strings.Split(filepath.ToSlash(clean), "/") {
+			if part == ".." || part == "." {
+				t.Fatalf("provider identity %q traversed outside the providers directory: %q", id, path)
+			}
+		}
+		if !strings.HasPrefix(path, providersRoot+string(os.PathSeparator)) {
+			t.Fatalf("provider identity %q left the providers directory: %q", id, path)
+		}
 	}
 }

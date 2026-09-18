@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,19 +58,20 @@ type Workspace struct {
 // executables and the workspace directory remain derived by Spynel; only the
 // explicit custom ACP profile accepts a command and shell-free argument list.
 type Harness struct {
-	Name                   string          `yaml:"name"`
-	Model                  string          `yaml:"model,omitempty"`
-	ReasoningEffort        string          `yaml:"reasoning_effort"`
-	ServiceMode            string          `yaml:"service_mode"`
-	Sandbox                string          `yaml:"sandbox"`
-	Routing                *HarnessRouting `yaml:"routing,omitempty"`
-	ChatAgentPrefix        string          `yaml:"chat_agent_prefix"`
-	DeveloperAgentPrefix   string          `yaml:"developer_agent_prefix"`
-	ReviewerAgentPrefix    string          `yaml:"reviewer_agent_prefix"`
-	HeartbeatAgentPrefix   string          `yaml:"heartbeat_agent_prefix"`
-	Reviews                string          `yaml:"reviews"`
-	ACPCommand             string          `yaml:"acp_command,omitempty"`
-	ACPArgs                []string        `yaml:"acp_args,omitempty"`
+	Name                   string                     `yaml:"name"`
+	Model                  string                     `yaml:"model,omitempty"`
+	ReasoningEffort        string                     `yaml:"reasoning_effort"`
+	ServiceMode            string                     `yaml:"service_mode"`
+	Sandbox                string                     `yaml:"sandbox"`
+	Routing                *HarnessRouting            `yaml:"routing,omitempty"`
+	Providers              map[string]ProviderProfile `yaml:"providers,omitempty"`
+	ChatAgentPrefix        string                     `yaml:"chat_agent_prefix"`
+	DeveloperAgentPrefix   string                     `yaml:"developer_agent_prefix"`
+	ReviewerAgentPrefix    string                     `yaml:"reviewer_agent_prefix"`
+	HeartbeatAgentPrefix   string                     `yaml:"heartbeat_agent_prefix"`
+	Reviews                string                     `yaml:"reviews"`
+	ACPCommand             string                     `yaml:"acp_command,omitempty"`
+	ACPArgs                []string                   `yaml:"acp_args,omitempty"`
 	reasoningEffortOmitted bool
 }
 
@@ -80,6 +83,18 @@ type HarnessRouting struct {
 	Reviewer     string `yaml:"reviewer,omitempty"`
 	Notification string `yaml:"notification,omitempty"`
 	Heartbeat    string `yaml:"heartbeat,omitempty"`
+}
+
+// ProviderProfile is one declared named provider instance. The owning map
+// key is the provider INSTANCE identity; Harness selects the catalog kind.
+type ProviderProfile struct {
+	Harness         string   `yaml:"harness"`
+	Model           string   `yaml:"model,omitempty"`
+	ReasoningEffort string   `yaml:"reasoning_effort,omitempty"`
+	ServiceMode     string   `yaml:"service_mode,omitempty"`
+	Sandbox         string   `yaml:"sandbox,omitempty"`
+	ACPCommand      string   `yaml:"acp_command,omitempty"`
+	ACPArgs         []string `yaml:"acp_args,omitempty"`
 }
 
 // NameForRole returns the configured harness profile for one logical role.
@@ -119,6 +134,28 @@ func (h Harness) RoleRoutingEnabled() bool {
 		h.Routing.Heartbeat != ""
 }
 
+// ProviderRef resolves one role selection to its provider instance: either
+// a legacy catalog kind reference or a declared named profile.
+type ProviderRef struct {
+	ID      string
+	Kind    string
+	Profile *ProviderProfile
+}
+
+// ProviderForRole resolves the provider instance behind one logical role:
+// empty routes fall back to the legacy primary harness, a declared provider
+// profile ID resolves its named instance, and any other value remains a
+// legacy catalog kind reference. This is a resolution primitive for profile
+// composition; production routing validation still accepts only catalog
+// kinds until that wiring lands atomically.
+func (h Harness) ProviderForRole(role harness.Role) ProviderRef {
+	name := h.NameForRole(role)
+	if profile, ok := h.Providers[name]; ok {
+		return ProviderRef{ID: name, Kind: profile.Harness, Profile: &profile}
+	}
+	return ProviderRef{ID: name, Kind: name}
+}
+
 func normalizeHarnessRouting(routing *HarnessRouting) {
 	if routing == nil {
 		return
@@ -127,6 +164,36 @@ func normalizeHarnessRouting(routing *HarnessRouting) {
 	routing.Reviewer = harness.NormalizeName(routing.Reviewer)
 	routing.Notification = harness.NormalizeName(routing.Notification)
 	routing.Heartbeat = harness.NormalizeName(routing.Heartbeat)
+}
+
+// providerIDPattern is the canonical provider instance identity syntax: one
+// to sixty-three lowercase letters, digits, hyphens, or underscores, starting
+// with a letter or digit. It excludes separators, dot components, and every
+// other path-relevant form.
+var providerIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
+
+// normalizeProviderProfiles normalizes declared provider instance identities
+// and their profile fields. Distinct raw keys that normalize to the same
+// instance identity are rejected instead of silently overwriting one another.
+func normalizeProviderProfiles(providers map[string]ProviderProfile) (map[string]ProviderProfile, error) {
+	if len(providers) == 0 {
+		return providers, nil
+	}
+	normalized := make(map[string]ProviderProfile, len(providers))
+	rawKeys := make(map[string]string, len(providers))
+	for id, profile := range providers {
+		key := strings.ToLower(strings.TrimSpace(id))
+		profile.Harness = harness.NormalizeName(profile.Harness)
+		profile.ReasoningEffort = normalizeInheritedValue(profile.ReasoningEffort)
+		profile.ServiceMode = normalizeServiceMode(profile.ServiceMode)
+		profile.Sandbox = normalizeSandbox(profile.Sandbox)
+		if previous, exists := rawKeys[key]; exists {
+			return nil, fmt.Errorf("harness.providers keys %q and %q normalize to the same provider identity %q", previous, id, key)
+		}
+		rawKeys[key] = id
+		normalized[key] = profile
+	}
+	return normalized, nil
 }
 
 // UsesLegacyReasoningEffort reports whether the historical medium value came
@@ -343,6 +410,11 @@ func decode(data []byte, abs string) (Config, error) {
 	}
 	cfg.Harness.Name = harness.NormalizeName(cfg.Harness.Name)
 	normalizeHarnessRouting(cfg.Harness.Routing)
+	profiles, normalizeErr := normalizeProviderProfiles(cfg.Harness.Providers)
+	if normalizeErr != nil {
+		return Config{}, normalizeErr
+	}
+	cfg.Harness.Providers = profiles
 	cfg.Harness.ReasoningEffort = normalizeInheritedValue(cfg.Harness.ReasoningEffort)
 	cfg.Harness.ServiceMode = normalizeServiceMode(cfg.Harness.ServiceMode)
 	cfg.Harness.Sandbox = normalizeSandbox(cfg.Harness.Sandbox)
@@ -448,15 +520,7 @@ func (c Config) Validate() error {
 	if (c.Harness.Name == "acp" || routedACP) && strings.TrimSpace(c.Harness.ACPCommand) == "" {
 		problems = append(problems, "harness.acp_command is required when harness.name or harness.routing selects acp")
 	}
-	if len(c.Harness.Model) > 1024 || !utf8.ValidString(c.Harness.Model) || strings.IndexFunc(c.Harness.Model, unicode.IsControl) >= 0 {
-		problems = append(problems, "harness.model must be one line of at most 1024 bytes")
-	}
-	if !harness.ValidReasoningEffort(normalizeInheritedValue(c.Harness.ReasoningEffort)) {
-		problems = append(problems, "harness.reasoning_effort must be inherit or a one-line identifier of at most 128 bytes")
-	}
-	if len(c.Harness.ServiceMode) > 128 || strings.IndexFunc(c.Harness.ServiceMode, unicode.IsControl) >= 0 {
-		problems = append(problems, "harness.service_mode must be one line of at most 128 bytes")
-	}
+	problems = appendInferenceLineProblems(problems, "harness", c.Harness.Model, c.Harness.ReasoningEffort, c.Harness.ServiceMode)
 	if acpHarnessName(c.Harness.Name) && c.Harness.ReasoningEffort != "" && !(c.Harness.reasoningEffortOmitted && c.Harness.ReasoningEffort == "medium") {
 		problems = append(problems, "harness.reasoning_effort is not supported for ACP harnesses; use inherit (legacy omitted configurations may retain medium without sending it)")
 	}
@@ -484,6 +548,16 @@ func (c Config) Validate() error {
 	case "read-only", "workspace-write", "danger-full-access":
 	default:
 		problems = append(problems, "harness.sandbox must be read-only, workspace-write, or danger-full-access")
+	}
+	if len(c.Harness.Providers) > 0 {
+		ids := make([]string, 0, len(c.Harness.Providers))
+		for id := range c.Harness.Providers {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			problems = appendProviderProfileProblems(problems, id, c.Harness.Providers[id])
+		}
 	}
 	for _, field := range []struct{ name, value string }{
 		{name: "chat_agent_prefix", value: c.Harness.ChatAgentPrefix},
@@ -588,6 +662,81 @@ func acpHarnessName(name string) bool {
 	default:
 		return false
 	}
+}
+
+// appendInferenceLineProblems applies the shared one-line inference value
+// checks used by both harness.* and each provider profile. Messages are
+// derived from the owning settings prefix.
+func appendInferenceLineProblems(problems []string, prefix, model, reasoningEffort, serviceMode string) []string {
+	if len(model) > 1024 || !utf8.ValidString(model) || strings.IndexFunc(model, unicode.IsControl) >= 0 {
+		problems = append(problems, prefix+".model must be one line of at most 1024 bytes")
+	}
+	if !harness.ValidReasoningEffort(normalizeInheritedValue(reasoningEffort)) {
+		problems = append(problems, prefix+".reasoning_effort must be inherit or a one-line identifier of at most 128 bytes")
+	}
+	if len(serviceMode) > 128 || strings.IndexFunc(serviceMode, unicode.IsControl) >= 0 {
+		problems = append(problems, prefix+".service_mode must be one line of at most 128 bytes")
+	}
+	return problems
+}
+
+// appendProviderProfileProblems validates one declared provider instance.
+// Profiles may be declared without being routed; validation never rejects a
+// profile for being unused.
+func appendProviderProfileProblems(problems []string, id string, profile ProviderProfile) []string {
+	prefix := "harness.providers." + id
+	if !providerIDPattern.MatchString(id) {
+		problems = append(problems, fmt.Sprintf("harness.providers key %q must be a non-empty lowercase instance identity of at most 63 bytes using letters, digits, - and _", id))
+	} else if _, ok := harness.Lookup(id); ok {
+		problems = append(problems, fmt.Sprintf("harness.providers key %q is reserved by a built-in harness kind; use an instance identity such as %s-dev", id, id))
+	}
+	if profile.Harness == "" {
+		problems = append(problems, prefix+".harness is required")
+	} else if _, ok := harness.Lookup(profile.Harness); !ok {
+		problems = append(problems, prefix+".harness is not a supported coding harness")
+	}
+	problems = appendInferenceLineProblems(problems, prefix, profile.Model, profile.ReasoningEffort, profile.ServiceMode)
+	if acpHarnessName(profile.Harness) && normalizeInheritedValue(profile.ReasoningEffort) != "" {
+		problems = append(problems, prefix+".reasoning_effort is not supported for ACP harnesses; use inherit")
+	}
+	if profile.Harness != "" && profile.Harness != "codex" && profile.ServiceMode != "" {
+		problems = append(problems, fmt.Sprintf("%s.service_mode is not supported for %s; use inherit", prefix, profile.Harness))
+	}
+	if profile.Harness == "acp" {
+		if strings.TrimSpace(profile.ACPCommand) == "" {
+			problems = append(problems, prefix+".acp_command is required when a provider profile selects the custom ACP harness")
+		}
+	} else if profile.Harness != "" {
+		if profile.ACPCommand != "" {
+			problems = append(problems, prefix+".acp_command is only supported when the profile harness is acp")
+		}
+		if len(profile.ACPArgs) > 0 {
+			problems = append(problems, prefix+".acp_args is only supported when the profile harness is acp")
+		}
+	}
+	if strings.ContainsRune(profile.ACPCommand, '\x00') {
+		problems = append(problems, prefix+".acp_command contains an invalid NUL byte")
+	}
+	for _, argument := range profile.ACPArgs {
+		if strings.ContainsRune(argument, '\x00') {
+			problems = append(problems, prefix+".acp_args contains an invalid NUL byte")
+			break
+		}
+		if !utf8.ValidString(argument) {
+			problems = append(problems, prefix+".acp_args contains invalid UTF-8")
+			break
+		}
+		if strings.ContainsAny(argument, "\r\n") {
+			problems = append(problems, prefix+".acp_args cannot contain multiline arguments")
+			break
+		}
+	}
+	switch profile.Sandbox {
+	case "", "read-only", "workspace-write", "danger-full-access":
+	default:
+		problems = append(problems, prefix+".sandbox must be empty (inherit), read-only, workspace-write, or danger-full-access")
+	}
+	return problems
 }
 
 // HasAllowedTelegramUser reports whether an allow-list contains at least one
@@ -704,6 +853,38 @@ func (c Config) HarnessSessionsPath(name string) string {
 		name = "unselected"
 	}
 	return c.StatePath("runtime", "harness-"+name+"-sessions.json")
+}
+
+// providerInstanceDirectory sanitizes a provider instance identity for use
+// as a single path component. Validation already restricts declared
+// identities to lowercase letters, digits, hyphens, and underscores; this
+// stays defensive for directly constructed references.
+func providerInstanceDirectory(id string) string {
+	component := strings.NewReplacer("/", "-", "\\", "-").Replace(strings.ToLower(strings.TrimSpace(id)))
+	switch component {
+	case "", ".", "..":
+		return "instance"
+	}
+	return component
+}
+
+// ProviderSessionsPath returns the canonical session map for one resolved
+// provider reference. Legacy kind references keep the historical shared
+// harness file exactly; named profiles persist inside an instance-scoped
+// providers directory because adapters such as Pi derive sibling state from
+// the session file's directory and two instances must not share it. A kind
+// change therefore moves the instance's session filename.
+func (c Config) ProviderSessionsPath(ref ProviderRef) string {
+	if ref.Profile == nil {
+		return c.HarnessSessionsPath(ref.Kind)
+	}
+	kind := strings.NewReplacer("/", "-", "\\", "-").Replace(strings.ToLower(strings.TrimSpace(ref.Kind)))
+	return c.StatePath(
+		"runtime",
+		"providers",
+		providerInstanceDirectory(ref.ID),
+		"harness-"+kind+"-sessions.json",
+	)
 }
 
 // HarnessArgs returns the shell-free process arguments for the selected
