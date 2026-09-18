@@ -53,6 +53,61 @@ func providerOwnerManager(cfg config.Config, runtime *harness.Runtime) *Manager 
 	return manager
 }
 
+type pinnedOwnerFixture struct {
+	runtime   *harness.Runtime
+	manager   *Manager
+	registry  *harness.Registry
+	spec      harness.RuntimeSpec
+	chat      *fakeHarness
+	owner     *availabilityHarness
+	alternate *availabilityHarness
+}
+
+func newPinnedOwnerFixture(t *testing.T, cfg config.Config, includeOwner bool, ownerStart func() error) *pinnedOwnerFixture {
+	t.Helper()
+	fixture := &pinnedOwnerFixture{
+		registry:  harness.NewRegistry(),
+		chat:      newFakeRecipient(),
+		owner:     &availabilityHarness{fakeHarness: newFakeRecipient(), start: ownerStart},
+		alternate: &availabilityHarness{fakeHarness: newFakeRecipient()},
+	}
+	fixture.registry.Register("chat", func(harness.HarnessConfig) (harness.Harness, error) { return fixture.chat, nil })
+	fixture.registry.Register("routed", func(cfg harness.HarnessConfig) (harness.Harness, error) {
+		switch cfg.Model {
+		case "owner":
+			return fixture.owner, nil
+		case "alternate":
+			return fixture.alternate, nil
+		default:
+			return nil, errors.New("unexpected routed provider fixture")
+		}
+	})
+	fixture.spec = harness.RuntimeSpec{
+		Providers: map[harness.ProviderID]harness.HarnessConfig{
+			"chat":    {Name: "chat"},
+			"glm-dev": {Name: "routed", Model: "alternate"},
+		},
+		Roles: map[harness.Role]harness.ProviderID{
+			harness.RoleChat:      "chat",
+			harness.RoleDeveloper: "glm-dev",
+		},
+	}
+	if includeOwner {
+		fixture.spec.Providers["codex-dev"] = harness.HarnessConfig{Name: "routed", Model: "owner"}
+	}
+	var err error
+	fixture.runtime, err = harness.NewRuntimeSpec(fixture.registry, fixture.spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fixture.runtime.Close() })
+	if err = fixture.runtime.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fixture.manager = providerOwnerManager(cfg, fixture.runtime)
+	return fixture
+}
+
 func providerOwnerTask(t *testing.T, cfg config.Config, title, status string) string {
 	t.Helper()
 	path, err := Create(cfg, "tasks", title, "")
@@ -157,6 +212,185 @@ func TestSameKindInstancesPersistDistinctOwners(t *testing.T) {
 	}
 }
 
+func TestRecoveryPinsDurableOwnerAcrossRoleRemapAndSameKind(t *testing.T) {
+	cfg := providerOwnerConfig(t)
+	working := providerOwnerTask(t, cfg, "pinned recovery owner", "working")
+	fixture := newPinnedOwnerFixture(t, cfg, true, nil)
+	lease := Lease{
+		ID: "pinned-owner", Route: "tasks", File: working, SessionKey: "pinned-owner-session",
+		Phase: phaseTaskImplementation, State: "processing", Provider: "codex-dev", ThreadID: "existing-thread",
+		StartedAt:   time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
+		HeartbeatAt: time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+	if err := fixture.manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.recoverStale(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fixture.manager.Wait()
+	if calls := fakeHarnessCalls(fixture.owner.fakeHarness); calls != 1 {
+		t.Fatalf("durable owner dispatches = %d, want 1", calls)
+	}
+	if calls := fakeHarnessCalls(fixture.alternate.fakeHarness); calls != 0 {
+		t.Fatalf("role-mapped alternate dispatches = %d, want 0", calls)
+	}
+	after, err := fixture.manager.loadLease(lease.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Provider != "codex-dev" || after.Provider == "routed" || after.Provider == "glm-dev" {
+		t.Fatalf("recovery owner = %q, want codex-dev", after.Provider)
+	}
+}
+
+func TestOwnedRecoveryUnavailableBlocksWithoutFallback(t *testing.T) {
+	cfg := providerOwnerConfig(t)
+	working := providerOwnerTask(t, cfg, "unavailable pinned owner", "working")
+	fixture := newPinnedOwnerFixture(t, cfg, true, func() error { return errors.New("owner unavailable") })
+	blockedAt := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
+	fixture.manager.heartbeatNow = func() time.Time { return blockedAt }
+	lease := Lease{
+		ID: "unavailable-owner", Route: "tasks", File: working, SessionKey: "unavailable-owner-session",
+		Phase: phaseTaskImplementation, State: "processing", Provider: "codex-dev", ThreadID: "preserved-thread",
+		StartedAt:   time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
+		HeartbeatAt: time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+	if err := fixture.manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.recoverStale(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := fixture.manager.loadLease(lease.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Blocked == nil || first.Blocked.Reason != LeaseBlockedProviderUnavailable || !first.Blocked.Since.Equal(blockedAt) {
+		t.Fatalf("unavailable owner block = %+v", first.Blocked)
+	}
+	expected := lease
+	expected.Blocked = first.Blocked
+	if !reflect.DeepEqual(first, expected) {
+		t.Fatalf("unavailable owner changed lease fields beyond Blocked:\n got: %#v\nwant: %#v", first, expected)
+	}
+	bytesAfterFirst, err := os.ReadFile(fixture.manager.leasePath(lease.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.manager.heartbeatNow = func() time.Time { return blockedAt.Add(time.Hour) }
+	if err = fixture.manager.recoverStale(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	bytesAfterSecond, err := os.ReadFile(fixture.manager.leasePath(lease.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(bytesAfterFirst, bytesAfterSecond) {
+		t.Fatal("repeated unavailable owned recovery rewrote lease")
+	}
+	if fakeHarnessCalls(fixture.owner.fakeHarness) != 0 || fakeHarnessCalls(fixture.alternate.fakeHarness) != 0 {
+		t.Fatal("unavailable owned recovery dispatched or fell back")
+	}
+}
+
+func TestOwnedRecoveryFencedPreservesLeaseWithoutFallback(t *testing.T) {
+	cfg := providerOwnerConfig(t)
+	working := providerOwnerTask(t, cfg, "fenced pinned owner", "working")
+	fixture := newPinnedOwnerFixture(t, cfg, true, nil)
+	blockedAt := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
+	lease := Lease{
+		ID: "fenced-owner", Route: "tasks", File: working, SessionKey: "fenced-owner-session",
+		Phase: phaseTaskImplementation, State: "processing", Provider: "codex-dev", ThreadID: "preserved-thread",
+		StartedAt:   time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
+		HeartbeatAt: time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
+		Blocked:     &LeaseBlock{Reason: LeaseBlockedProviderUnavailable, Since: blockedAt},
+	}
+	if err := fixture.manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(fixture.manager.leasePath(lease.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, proceed := make(chan struct{}), make(chan struct{})
+	candidate := &availabilityHarness{fakeHarness: newFakeRecipient(), start: func() error {
+		close(entered)
+		<-proceed
+		return nil
+	}}
+	fixture.registry.Register("routed", func(harness.HarnessConfig) (harness.Harness, error) { return candidate, nil })
+	next := fixture.spec
+	next.Providers = make(map[harness.ProviderID]harness.HarnessConfig, len(fixture.spec.Providers))
+	for id, provider := range fixture.spec.Providers {
+		next.Providers[id] = provider
+	}
+	ownerConfig := next.Providers["codex-dev"]
+	ownerConfig.Sandbox = "read-only"
+	next.Providers["codex-dev"] = ownerConfig
+	done := make(chan error, 1)
+	go func() { done <- fixture.runtime.Reconcile(context.Background(), next) }()
+	<-entered
+	recoverErr := fixture.manager.recoverStale(context.Background())
+	close(proceed)
+	reconcileErr := <-done
+	if recoverErr != nil {
+		t.Fatal(recoverErr)
+	}
+	if reconcileErr != nil {
+		t.Fatal(reconcileErr)
+	}
+	after, err := os.ReadFile(fixture.manager.leasePath(lease.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("fenced owned recovery mutated durable lease")
+	}
+	if fakeHarnessCalls(fixture.owner.fakeHarness) != 0 || fakeHarnessCalls(fixture.alternate.fakeHarness) != 0 {
+		t.Fatal("fenced owned recovery dispatched or fell back")
+	}
+}
+
+func TestOwnedRecoveryAbsentPreservesLeaseWithoutFallback(t *testing.T) {
+	cfg := providerOwnerConfig(t)
+	working := providerOwnerTask(t, cfg, "absent pinned owner", "working")
+	fixture := newPinnedOwnerFixture(t, cfg, false, nil)
+	lease := Lease{
+		ID: "absent-owner", Route: "tasks", File: working, SessionKey: "absent-owner-session",
+		Phase: phaseTaskImplementation, State: "processing", Provider: "codex-dev", ThreadID: "preserved-thread",
+		StartedAt:   time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
+		HeartbeatAt: time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+	if err := fixture.manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(fixture.manager.leasePath(lease.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.manager.recoverStale(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(fixture.manager.leasePath(lease.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("absent owned recovery mutated durable lease")
+	}
+	loaded, err := fixture.manager.loadLease(lease.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Provider != lease.Provider || loaded.ThreadID != lease.ThreadID || loaded.Blocked != nil {
+		t.Fatalf("absent owner changed lease: %#v", loaded)
+	}
+	if fakeHarnessCalls(fixture.alternate.fakeHarness) != 0 || fakeHarnessCalls(fixture.chat) != 0 {
+		t.Fatal("absent owned recovery fell back")
+	}
+}
+
 func TestFailedReservationDoesNotPersistProvider(t *testing.T) {
 	for _, fenced := range []bool{false, true} {
 		name := "unavailable"
@@ -256,11 +490,8 @@ func TestLegacyLeaseAdoptsProviderOnSuccessfulRecovery(t *testing.T) {
 	cfg := providerOwnerConfig(t)
 	cfg.Orchestrator.MaxParallel = 1
 	working := providerOwnerTask(t, cfg, "legacy provider adoption", "working")
-	spec := harness.RuntimeSpec{
-		Providers: map[harness.ProviderID]harness.HarnessConfig{"chat": {Name: "chat"}, "legacy-owner": {Name: "routed"}},
-		Roles:     map[harness.Role]harness.ProviderID{harness.RoleChat: "chat", harness.RoleDeveloper: "legacy-owner"},
-	}
-	manager := providerOwnerManager(cfg, providerOwnerRuntime(t, spec))
+	fixture := newPinnedOwnerFixture(t, cfg, true, nil)
+	manager := fixture.manager
 	blockedAt := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
 	before := Lease{
 		ID: "legacy-adoption", Route: "tasks", File: working, SessionKey: "legacy-adoption-session",
@@ -306,7 +537,7 @@ func TestLegacyLeaseAdoptsProviderOnSuccessfulRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := before
-	expected.Provider = "legacy-owner"
+	expected.Provider = "glm-dev"
 	expected.OwnerID = manager.ownerID
 	expected.HeartbeatAt = after.HeartbeatAt
 	expected.Blocked = nil
@@ -319,17 +550,23 @@ func TestLegacyLeaseAdoptsProviderOnSuccessfulRecovery(t *testing.T) {
 	manager.releaseCapacity()
 	capacityHeld = false
 	manager.Wait()
+	if calls := fakeHarnessCalls(fixture.alternate.fakeHarness); calls != 1 {
+		t.Fatalf("legacy owner adoption dispatches = %d, want 1", calls)
+	}
+	if calls := fakeHarnessCalls(fixture.owner.fakeHarness); calls != 0 {
+		t.Fatalf("legacy recovery used non-role provider %d times", calls)
+	}
 }
 
-func TestEmptyReservationProviderIDPreservesExistingOwner(t *testing.T) {
+func TestEmptyReservationProviderIDLeavesLegacyOwnerEmpty(t *testing.T) {
 	cfg := providerOwnerConfig(t)
 	cfg.Orchestrator.MaxParallel = 1
-	working := providerOwnerTask(t, cfg, "empty reservation preserves owner", "working")
+	working := providerOwnerTask(t, cfg, "empty reservation leaves legacy owner empty", "working")
 	target := newFakeRecipient()
 	manager := New(cfg, target, extensions.Runner{})
 	lease := Lease{
-		ID: "existing-durable-owner", Route: "tasks", File: working, SessionKey: "existing-owner-session",
-		Phase: phaseTaskImplementation, State: "processing", Provider: "existing-owner",
+		ID: "legacy-empty-owner", Route: "tasks", File: working, SessionKey: "legacy-empty-owner-session",
+		Phase: phaseTaskImplementation, State: "processing",
 		StartedAt:   time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
 		HeartbeatAt: time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
 	}
@@ -356,8 +593,8 @@ func TestEmptyReservationProviderIDPreservesExistingOwner(t *testing.T) {
 	if after.OwnerID != manager.ownerID || after.Blocked != nil {
 		t.Fatalf("stale lease did not reach the successful recovery save: %#v", after)
 	}
-	if after.Provider != "existing-owner" {
-		t.Fatalf("empty reservation provider id erased durable owner: got %q, want existing-owner", after.Provider)
+	if after.Provider != "" {
+		t.Fatalf("empty reservation provider id invented durable owner %q", after.Provider)
 	}
 	manager.releaseCapacity()
 	capacityHeld = false
@@ -369,8 +606,8 @@ func TestEmptyReservationProviderIDPreservesExistingOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if final.Provider != "existing-owner" {
-		t.Fatalf("recovery dispatch lost durable owner: got %q, want existing-owner", final.Provider)
+	if final.Provider != "" {
+		t.Fatalf("dispatch invented durable owner from empty reservation id: %q", final.Provider)
 	}
 }
 
@@ -451,11 +688,27 @@ func TestProviderSurvivesDispatchSaves(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := providerOwnerConfig(t)
 			working := providerOwnerTask(t, cfg, "provider survives "+name, "working")
-			var target harness.ExecutionTarget = newFakeRecipient()
+			var target harness.Harness = newFakeRecipient()
 			if sendFailure {
 				target = &providerOwnerSendFailureHarness{fakeHarness: newFakeRecipient()}
 			}
-			manager := New(cfg, target, extensions.Runner{})
+			registry := harness.NewRegistry()
+			registry.Register("routed", func(harness.HarnessConfig) (harness.Harness, error) { return target, nil })
+			runtime, err := harness.NewRuntimeSpec(registry, harness.RuntimeSpec{
+				Providers: map[harness.ProviderID]harness.HarnessConfig{"durable-instance": {Name: "routed"}},
+				Roles: map[harness.Role]harness.ProviderID{
+					harness.RoleChat:      "durable-instance",
+					harness.RoleDeveloper: "durable-instance",
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer runtime.Close()
+			if err = runtime.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			manager := providerOwnerManager(cfg, runtime)
 			lease := Lease{
 				ID: "provider-survives-" + name, Route: "tasks", File: working, SessionKey: "provider-survives-session-" + name,
 				Phase: phaseTaskImplementation, State: "processing", Provider: "durable-instance",

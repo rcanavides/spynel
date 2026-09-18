@@ -734,6 +734,18 @@ func numberValue(value any) int {
 	return 0
 }
 
+func (m *Manager) reserveLease(lease Lease) (harness.ProviderID, func(), error) {
+	target := m.harnessForPhase(lease.Phase)
+	if lease.Provider == "" {
+		return harness.ReserveExecution(target, lease.SessionKey)
+	}
+	release, err := harness.ReserveOwnedExecution(target, lease.SessionKey, lease.Provider)
+	if err != nil {
+		return "", nil, err
+	}
+	return lease.Provider, release, nil
+}
+
 func (m *Manager) ensureRouteDirectories() error {
 	for _, path := range m.WorkflowDirectories() {
 		if err := os.MkdirAll(path, 0700); err != nil {
@@ -745,7 +757,7 @@ func (m *Manager) ensureRouteDirectories() error {
 }
 
 func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease, recovery bool) {
-	_, release, err := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
+	_, release, err := m.reserveLease(lease)
 	if err != nil {
 		m.markBlocked(ctx, lease, err)
 		return
@@ -1205,7 +1217,7 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		if lease.State != "claiming" || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
-		providerID, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
+		providerID, held, reserveErr := m.reserveLease(lease)
 		if reserveErr != nil {
 			m.markBlocked(ctx, lease, reserveErr)
 			continue
@@ -1600,7 +1612,7 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 		if (lease.Blocked == nil && !foreignOwner && now.Sub(lease.HeartbeatAt) < route.StaleAfter) || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
-		providerID, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
+		providerID, held, reserveErr := m.reserveLease(lease)
 		if reserveErr != nil {
 			m.markBlocked(ctx, lease, reserveErr)
 			continue
