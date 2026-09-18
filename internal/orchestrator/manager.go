@@ -33,25 +33,26 @@ type LeaseBlock struct {
 }
 
 type Lease struct {
-	ID                     string          `json:"id"`
-	ClaimID                string          `json:"claim_id,omitempty"`
-	DocumentType           string          `json:"document_type,omitempty"`
-	OwnerID                string          `json:"owner_id,omitempty"`
-	Route                  string          `json:"route"`
-	File                   string          `json:"file"`
-	SourceFile             string          `json:"source_file,omitempty"`
-	SessionKey             string          `json:"session_key"`
-	ThreadID               string          `json:"thread_id,omitempty"`
-	State                  string          `json:"state"`
-	StartedAt              time.Time       `json:"started_at"`
-	HeartbeatAt            time.Time       `json:"heartbeat_at"`
-	RecoveryCount          int             `json:"recovery_count"`
-	LastError              string          `json:"last_error,omitempty"`
-	Blocked                *LeaseBlock     `json:"blocked,omitempty"`
-	Phase                  string          `json:"phase,omitempty"`
-	ClaimAttempt           int             `json:"claim_attempt,omitempty"`
-	ImplementerThread      string          `json:"implementer_thread,omitempty"`
-	TerminalHooksCompleted map[string]bool `json:"terminal_hooks_completed,omitempty"`
+	ID                     string             `json:"id"`
+	ClaimID                string             `json:"claim_id,omitempty"`
+	DocumentType           string             `json:"document_type,omitempty"`
+	OwnerID                string             `json:"owner_id,omitempty"`
+	Provider               harness.ProviderID `json:"provider,omitempty"`
+	Route                  string             `json:"route"`
+	File                   string             `json:"file"`
+	SourceFile             string             `json:"source_file,omitempty"`
+	SessionKey             string             `json:"session_key"`
+	ThreadID               string             `json:"thread_id,omitempty"`
+	State                  string             `json:"state"`
+	StartedAt              time.Time          `json:"started_at"`
+	HeartbeatAt            time.Time          `json:"heartbeat_at"`
+	RecoveryCount          int                `json:"recovery_count"`
+	LastError              string             `json:"last_error,omitempty"`
+	Blocked                *LeaseBlock        `json:"blocked,omitempty"`
+	Phase                  string             `json:"phase,omitempty"`
+	ClaimAttempt           int                `json:"claim_attempt,omitempty"`
+	ImplementerThread      string             `json:"implementer_thread,omitempty"`
+	TerminalHooksCompleted map[string]bool    `json:"terminal_hooks_completed,omitempty"`
 }
 
 type ScheduledCheckpoint struct {
@@ -608,11 +609,14 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 		if phase == phaseTaskReview {
 			lease.ImplementerThread, _ = document.FrontMatter["implementation_thread"].(string)
 		}
-		_, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(phase), lease.SessionKey)
+		providerID, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(phase), lease.SessionKey)
 		if reserveErr != nil {
 			continue
 		}
 		release = held
+		if providerID != "" {
+			lease.Provider = providerID
+		}
 		if err := m.saveLease(lease); err != nil {
 			return err
 		}
@@ -680,7 +684,7 @@ func (m *Manager) startExistingClaim(ctx context.Context, route workflowRoute, p
 	if incrementAttempt || attempt == 0 {
 		nextAttempt++
 	}
-	_, release, reserveErr := harness.ReserveExecution(m.harnessForPhase(phase), phaseSessionKey(route.Name, id, phase, nextAttempt))
+	providerID, release, reserveErr := harness.ReserveExecution(m.harnessForPhase(phase), phaseSessionKey(route.Name, id, phase, nextAttempt))
 	if reserveErr != nil {
 		return nil
 	}
@@ -707,6 +711,9 @@ func (m *Manager) startExistingClaim(ctx context.Context, route workflowRoute, p
 	}
 	if phase == phaseTaskReview {
 		lease.ImplementerThread, _ = document.FrontMatter["implementation_thread"].(string)
+	}
+	if providerID != "" {
+		lease.Provider = providerID
 	}
 	if err := m.saveLease(lease); err != nil {
 		return err
@@ -1198,12 +1205,15 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		if lease.State != "claiming" || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
-		_, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
+		providerID, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
 		if reserveErr != nil {
 			m.markBlocked(ctx, lease, reserveErr)
 			continue
 		}
 		release = held
+		if providerID != "" {
+			lease.Provider = providerID
+		}
 		if _, err := os.Stat(lease.File); os.IsNotExist(err) && lease.SourceFile != "" {
 			if _, sourceErr := os.Stat(lease.SourceFile); sourceErr == nil {
 				phase := normalizeLeasePhase(lease.Route, lease.Phase)
@@ -1590,12 +1600,15 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 		if (lease.Blocked == nil && !foreignOwner && now.Sub(lease.HeartbeatAt) < route.StaleAfter) || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
-		_, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
+		providerID, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
 		if reserveErr != nil {
 			m.markBlocked(ctx, lease, reserveErr)
 			continue
 		}
 		release = held
+		if providerID != "" {
+			lease.Provider = providerID
+		}
 		lease.OwnerID = m.ownerID
 		lease.HeartbeatAt = time.Now().UTC()
 		clearBlocked(&lease)
@@ -2121,7 +2134,9 @@ func leaseID(route, path string) string {
 	return hex.EncodeToString(hash[:12])
 }
 
-// ExecutionProvider is process-local admission metadata, never durable lease ownership.
+// ExecutionProvider reports process-local admission metadata for job
+// attribution. Durable Lease.Provider is written only from successful
+// reservations in the workflow ownership paths.
 func (m *Manager) ExecutionProvider(lease Lease) harness.ProviderID {
 	return harness.ExecutionProvider(m.harnessForPhase(lease.Phase), lease.SessionKey)
 }
