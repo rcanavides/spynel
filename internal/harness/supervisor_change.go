@@ -7,6 +7,9 @@ import (
 )
 
 var (
+	// ErrProviderAbsent means an exact provider instance is not present in the
+	// currently published Runtime topology.
+	ErrProviderAbsent = errors.New("provider instance is absent from the runtime topology")
 	// ErrProviderFenced means structural preparation temporarily bars admission.
 	ErrProviderFenced = errors.New("provider is fenced for a structural change")
 	// ErrProviderUnavailable identifies failure to select a running provider,

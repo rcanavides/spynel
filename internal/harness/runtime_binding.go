@@ -93,6 +93,64 @@ func (t *runtimeTarget) admit(key string) (*binding, error) {
 	}
 }
 
+// admitOwned reserves an existing execution on its exact durable owner. It
+// deliberately does not consult the target's current role mapping.
+func (t *runtimeTarget) admitOwned(key string, owner ProviderID) (*binding, error) {
+	r := t.runtime
+	r.sweepBindings()
+	for {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return nil, ErrProviderUnavailable
+		}
+		if owner == "" {
+			r.mu.Unlock()
+			return nil, ErrProviderAbsent
+		}
+		b := r.bindings[key]
+		if b != nil && b.admitting == 0 {
+			r.mu.Unlock()
+			active := b.provider.IsActive(key)
+			r.mu.Lock()
+			if r.bindings[key] != b || b.admitting != 0 {
+				r.mu.Unlock()
+				continue
+			}
+			if !active {
+				delete(r.bindings, key)
+				b = nil
+			}
+		}
+		if b != nil && b.id != owner {
+			r.mu.Unlock()
+			return nil, ErrProviderFenced
+		}
+		var route providerRoute
+		if b != nil {
+			route = providerRoute{id: b.id, provider: b.provider}
+		} else {
+			entry := r.providers[owner]
+			if entry == nil {
+				r.mu.Unlock()
+				return nil, ErrProviderAbsent
+			}
+			route = providerRoute{id: entry.id, provider: entry.supervisor}
+		}
+		if r.providerFencedLocked(route.provider) {
+			r.mu.Unlock()
+			return nil, ErrProviderFenced
+		}
+		if b == nil || b.admitting == 0 {
+			b = &binding{id: route.id, provider: route.provider}
+			r.bindings[key] = b
+		}
+		b.admitting++
+		r.mu.Unlock()
+		return b, nil
+	}
+}
+
 // ReserveExecution pins the exact owner through application job admission and
 // dispatch. The caller must release on every path; no runtime lock is retained.
 // Orchestrator scans use this fail-fast admission: a structural fence leaves
@@ -103,6 +161,17 @@ func (t *runtimeTarget) ReserveExecution(key string) (ProviderID, func(), error)
 		return "", nil, err
 	}
 	return t.reserved(key, b)
+}
+
+// ReserveOwnedExecution pins an existing execution to its exact provider
+// instance. It never resolves the target's current role.
+func (t *runtimeTarget) ReserveOwnedExecution(key string, owner ProviderID) (func(), error) {
+	b, err := t.admitOwned(key, owner)
+	if err != nil {
+		return nil, err
+	}
+	_, release, err := t.reserved(key, b)
+	return release, err
 }
 
 // ReserveExecutionWait admits like an ordinary turn, waiting through a
@@ -149,6 +218,31 @@ func ReserveExecution(target ExecutionTarget, key string) (ProviderID, func(), e
 		id = ProviderID(c.HarnessConfig().Name)
 	}
 	return id, func() {}, nil
+}
+
+// ReserveOwnedExecution reserves existing work on its exact provider instance.
+// Injected targets without owned admission may use their ordinary reservation
+// only when it reports the requested owner.
+func ReserveOwnedExecution(target ExecutionTarget, key string, owner ProviderID) (func(), error) {
+	if reserver, ok := target.(interface {
+		ReserveOwnedExecution(string, ProviderID) (func(), error)
+	}); ok {
+		return reserver.ReserveOwnedExecution(key, owner)
+	}
+	if owner == "" {
+		return nil, ErrProviderAbsent
+	}
+	id, release, err := ReserveExecution(target, key)
+	if err != nil {
+		return nil, err
+	}
+	if id == owner {
+		return release, nil
+	}
+	if release != nil {
+		release()
+	}
+	return nil, ErrProviderAbsent
 }
 
 // ReserveExecutionWait waits through structural fences where interactive chat
