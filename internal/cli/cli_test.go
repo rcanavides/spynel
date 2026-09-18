@@ -2104,6 +2104,315 @@ func TestBuildServiceLiveACPArgsPropagateToRoutedACP(t *testing.T) {
 	}
 }
 
+// normalizeHarnessSpecForComparison removes the per-call stderr writer, a
+// non-semantic composition field, so golden comparisons can use DeepEqual.
+func normalizeHarnessSpecForComparison(spec harness.RuntimeSpec) harness.RuntimeSpec {
+	for id, cfg := range spec.Providers {
+		cfg.Stderr = nil
+		spec.Providers[id] = cfg
+	}
+	return spec
+}
+
+// expectedLegacyHarnessCommand reproduces today's command resolution order,
+// including the catalog fallback when resolution fails, so golden tests pin
+// composition semantics instead of machine installation state.
+func expectedLegacyHarnessCommand(name, customCommand string) string {
+	command, err := harness.ResolveConfiguredCommand(name, customCommand, nil)
+	if err != nil {
+		if definition, ok := harness.Lookup(name); ok {
+			return definition.Command
+		}
+	}
+	return command
+}
+
+// expectedLegacyHarnessConfig is the independent golden expectation for one
+// legacy provider composition: primary providers keep the full historical
+// inference configuration, routed providers inherit only the global sandbox
+// and their per-kind session path, and only the custom ACP kind reuses the
+// global command/argument configuration.
+func expectedLegacyHarnessConfig(cfg config.Config, name, version string, primary bool) harness.HarnessConfig {
+	expected := harness.HarnessConfig{
+		Name:           name,
+		Cwd:            cfg.Root,
+		ApprovalPolicy: "never",
+		Sandbox:        cfg.Harness.Sandbox,
+		Network:        false,
+		SessionsFile:   cfg.HarnessSessionsPath(name),
+		Version:        version,
+	}
+	if primary {
+		expected.Model = cfg.Harness.Model
+		expected.Effort = cfg.Harness.ReasoningEffort
+		expected.LegacyEffort = cfg.Harness.UsesLegacyReasoningEffort()
+		expected.ServiceMode = cfg.Harness.ServiceMode
+		expected.Command = expectedLegacyHarnessCommand(name, cfg.Harness.ACPCommand)
+		expected.Args = harness.CommandArgs(name, cfg.Harness.ACPArgs)
+		return expected
+	}
+	if name == "acp" {
+		expected.Command = expectedLegacyHarnessCommand(name, cfg.Harness.ACPCommand)
+		expected.Args = harness.CommandArgs(name, cfg.Harness.ACPArgs)
+		return expected
+	}
+	expected.Command = expectedLegacyHarnessCommand(name, "")
+	expected.Args = harness.CommandArgs(name, nil)
+	return expected
+}
+
+func TestHarnessRuntimeSpecLegacySingle(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "codex"
+	cfg.Harness.Model = "gpt-legacy-test"
+	cfg.Harness.ReasoningEffort = "high"
+	cfg.Harness.ServiceMode = "priority"
+	cfg.Harness.Sandbox = "workspace-write"
+
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "legacy-single-spec")
+	defer runtimeState.Close()
+
+	spec := harnessRuntimeSpec(cfg, "test", runtimeState)
+
+	if len(spec.Providers) != 1 {
+		t.Fatalf("legacy single spec has %d providers, want 1", len(spec.Providers))
+	}
+	primary, ok := spec.Providers[harness.ProviderID("codex")]
+	if !ok {
+		t.Fatal("legacy single spec is missing the codex provider")
+	}
+	if primary.Name != "codex" {
+		t.Fatalf("primary harness name = %q, want codex", primary.Name)
+	}
+	if primary.Model != "gpt-legacy-test" || primary.Effort != "high" || primary.ServiceMode != "priority" {
+		t.Fatalf("primary inference settings = %+v", primary)
+	}
+	if primary.LegacyEffort != cfg.Harness.UsesLegacyReasoningEffort() {
+		t.Fatalf("primary legacy effort = %t", primary.LegacyEffort)
+	}
+	if primary.Sandbox != "workspace-write" {
+		t.Fatalf("primary sandbox = %q, want preserved value", primary.Sandbox)
+	}
+	if primary.SessionsFile != cfg.HarnessSessionsPath("codex") {
+		t.Fatalf("primary sessions file = %q", primary.SessionsFile)
+	}
+
+	expected := harness.RuntimeSpec{
+		Providers: map[harness.ProviderID]harness.HarnessConfig{
+			"codex": expectedLegacyHarnessConfig(cfg, "codex", "test", true),
+		},
+		Roles: map[harness.Role]harness.ProviderID{
+			harness.RoleChat:         "codex",
+			harness.RoleDeveloper:    "codex",
+			harness.RoleReviewer:     "codex",
+			harness.RoleNotification: "codex",
+			harness.RoleHeartbeat:    "codex",
+		},
+	}
+	if got := normalizeHarnessSpecForComparison(spec); !reflect.DeepEqual(got, expected) {
+		t.Fatalf("legacy single spec mismatch:\ngot  %#v\nwant %#v", got, expected)
+	}
+}
+
+func TestHarnessRuntimeSpecLegacyRouting(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Model = "primary-model"
+	cfg.Harness.ReasoningEffort = "high"
+	cfg.Harness.ServiceMode = "priority"
+	cfg.Harness.Sandbox = "read-only"
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer: "codex",
+		Reviewer:  "claude-code",
+	}
+
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "legacy-routing-spec")
+	defer runtimeState.Close()
+
+	spec := harnessRuntimeSpec(cfg, "test", runtimeState)
+
+	expectedRoles := map[harness.Role]harness.ProviderID{
+		harness.RoleChat:         "agent-zero",
+		harness.RoleDeveloper:    "codex",
+		harness.RoleReviewer:     "claude-code",
+		harness.RoleNotification: "agent-zero",
+		harness.RoleHeartbeat:    "agent-zero",
+	}
+	if !reflect.DeepEqual(spec.Roles, expectedRoles) {
+		t.Fatalf("routing roles = %#v, want %#v", spec.Roles, expectedRoles)
+	}
+	if len(spec.Providers) != 3 {
+		t.Fatalf("routed spec has %d providers, want 3", len(spec.Providers))
+	}
+	primary := spec.Providers["agent-zero"]
+	if primary.Name != "agent-zero" || primary.Model != "primary-model" || primary.Effort != "high" || primary.ServiceMode != "priority" {
+		t.Fatalf("primary composition = %+v", primary)
+	}
+	for name, sessions := range map[string]string{
+		"codex":       cfg.HarnessSessionsPath("codex"),
+		"claude-code": cfg.HarnessSessionsPath("claude-code"),
+	} {
+		routed, ok := spec.Providers[harness.ProviderID(name)]
+		if !ok {
+			t.Fatalf("routed spec is missing %s", name)
+		}
+		if routed.Model != "" || routed.Effort != "" || routed.ServiceMode != "" || routed.LegacyEffort {
+			t.Fatalf("routed %s inherited primary inference settings: %+v", name, routed)
+		}
+		if routed.Sandbox != "read-only" {
+			t.Fatalf("routed %s sandbox = %q, want the global value", name, routed.Sandbox)
+		}
+		if routed.SessionsFile != sessions {
+			t.Fatalf("routed %s sessions file = %q", name, routed.SessionsFile)
+		}
+	}
+
+	expected := harness.RuntimeSpec{
+		Providers: map[harness.ProviderID]harness.HarnessConfig{
+			"agent-zero":  expectedLegacyHarnessConfig(cfg, "agent-zero", "test", true),
+			"codex":       expectedLegacyHarnessConfig(cfg, "codex", "test", false),
+			"claude-code": expectedLegacyHarnessConfig(cfg, "claude-code", "test", false),
+		},
+		Roles: expectedRoles,
+	}
+	if got := normalizeHarnessSpecForComparison(spec); !reflect.DeepEqual(got, expected) {
+		t.Fatalf("routing spec mismatch:\ngot  %#v\nwant %#v", got, expected)
+	}
+}
+
+func TestHarnessRuntimeSpecLegacyRoutedACP(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "codex"
+	cfg.Harness.Model = "primary-model"
+	cfg.Harness.Sandbox = "workspace-write"
+	cfg.Harness.ACPCommand = executable
+	cfg.Harness.ACPArgs = []string{"--flag", "value with spaces"}
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer: "acp",
+	}
+
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "legacy-routed-acp-spec")
+	defer runtimeState.Close()
+
+	spec := harnessRuntimeSpec(cfg, "test", runtimeState)
+
+	if len(spec.Providers) != 2 {
+		t.Fatalf("routed ACP spec has %d providers, want 2", len(spec.Providers))
+	}
+	routed, ok := spec.Providers[harness.ProviderID("acp")]
+	if !ok {
+		t.Fatal("routed ACP spec is missing the acp provider")
+	}
+	if routed.Command != expectedLegacyHarnessCommand("acp", executable) {
+		t.Fatalf("routed ACP command = %q, want the global configured command", routed.Command)
+	}
+	if !reflect.DeepEqual(routed.Args, []string{"--flag", "value with spaces"}) {
+		t.Fatalf("routed ACP args = %#v, want the global configured args", routed.Args)
+	}
+	if routed.Model != "" || routed.Effort != "" || routed.ServiceMode != "" {
+		t.Fatalf("routed ACP inherited primary inference settings: %+v", routed)
+	}
+	if routed.Sandbox != "workspace-write" {
+		t.Fatalf("routed ACP sandbox = %q", routed.Sandbox)
+	}
+	if routed.SessionsFile != cfg.HarnessSessionsPath("acp") {
+		t.Fatalf("routed ACP sessions file = %q", routed.SessionsFile)
+	}
+
+	expected := harness.RuntimeSpec{
+		Providers: map[harness.ProviderID]harness.HarnessConfig{
+			"codex": expectedLegacyHarnessConfig(cfg, "codex", "test", true),
+			"acp":   expectedLegacyHarnessConfig(cfg, "acp", "test", false),
+		},
+		Roles: map[harness.Role]harness.ProviderID{
+			harness.RoleChat:         "codex",
+			harness.RoleDeveloper:    "acp",
+			harness.RoleReviewer:     "codex",
+			harness.RoleNotification: "codex",
+			harness.RoleHeartbeat:    "codex",
+		},
+	}
+	if got := normalizeHarnessSpecForComparison(spec); !reflect.DeepEqual(got, expected) {
+		t.Fatalf("routed ACP spec mismatch:\ngot  %#v\nwant %#v", got, expected)
+	}
+}
+
+func TestHarnessRuntimeSpecNoHarnessSentinel(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = ""
+
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "no-harness-sentinel-spec")
+	defer runtimeState.Close()
+
+	spec := harnessRuntimeSpec(cfg, "test", runtimeState)
+
+	if len(spec.Providers) != 1 {
+		t.Fatalf("no-harness sentinel spec has %d providers, want 1", len(spec.Providers))
+	}
+	if _, ok := spec.Providers[harness.ProviderID("")]; !ok {
+		t.Fatal("no-harness sentinel spec lost the empty provider identity")
+	}
+	expectedRoles := map[harness.Role]harness.ProviderID{
+		harness.RoleChat:         "",
+		harness.RoleDeveloper:    "",
+		harness.RoleReviewer:     "",
+		harness.RoleNotification: "",
+		harness.RoleHeartbeat:    "",
+	}
+	if !reflect.DeepEqual(spec.Roles, expectedRoles) {
+		t.Fatalf("sentinel roles = %#v, want %#v", spec.Roles, expectedRoles)
+	}
+	expected := harness.RuntimeSpec{
+		Providers: map[harness.ProviderID]harness.HarnessConfig{
+			"": expectedLegacyHarnessConfig(cfg, "", "test", true),
+		},
+		Roles: expectedRoles,
+	}
+	if got := normalizeHarnessSpecForComparison(spec); !reflect.DeepEqual(got, expected) {
+		t.Fatalf("no-harness sentinel spec mismatch:\ngot  %#v\nwant %#v", got, expected)
+	}
+
+	runtime, err := harness.NewRuntimeSpec(harness.NewBuiltinRegistry(), spec)
+	if err != nil {
+		t.Fatalf("no-harness sentinel rejected by NewRuntimeSpec: %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func targetHarnessConfig(target harness.ExecutionTarget) harness.HarnessConfig {
 	return target.(interface{ HarnessConfig() harness.HarnessConfig }).HarnessConfig()
 }

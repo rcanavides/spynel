@@ -1115,6 +1115,87 @@ func writeCLIEvent(output io.Writer, streamed *strings.Builder, event core.Event
 	return false, nil
 }
 
+// providerSettings is the CLI-internal resolved settings layer for one
+// provider composition. Named provider profiles can later reuse the same
+// HarnessConfig builder from resolved values without duplicating CLI
+// composition logic.
+type providerSettings struct {
+	kind         string
+	model        string
+	effort       string
+	serviceMode  string
+	sandbox      string
+	acpCommand   string
+	sessionsFile string
+	legacyEffort bool
+	acpArgs      []string
+}
+
+// legacyProviderSettings resolves today's primary/routed provider semantics:
+// the primary communication harness keeps the complete historical inference
+// configuration, routed harnesses use their own provider defaults, and only
+// the custom ACP kind reuses the single global command/argument configuration.
+func legacyProviderSettings(cfg config.Config, kind string, primary bool) providerSettings {
+	settings := providerSettings{
+		kind:         kind,
+		sandbox:      cfg.Harness.Sandbox,
+		sessionsFile: cfg.HarnessSessionsPath(kind),
+	}
+	if primary {
+		settings.model = cfg.Harness.Model
+		settings.effort = cfg.Harness.ReasoningEffort
+		settings.legacyEffort = cfg.Harness.UsesLegacyReasoningEffort()
+		settings.serviceMode = cfg.Harness.ServiceMode
+		settings.acpCommand = cfg.Harness.ACPCommand
+		settings.acpArgs = cfg.Harness.ACPArgs
+		return settings
+	}
+	if kind == "acp" {
+		// There is currently one custom ACP command/argument configuration.
+		// Allow an explicitly routed custom ACP harness to reuse it.
+		settings.acpCommand = cfg.Harness.ACPCommand
+		settings.acpArgs = cfg.Harness.ACPArgs
+	}
+	return settings
+}
+
+// harnessProviderConfig builds the provider-neutral HarnessConfig shared by
+// primary and routed providers. It owns only composition logic common to
+// both paths; every policy remains exactly as before.
+func harnessProviderConfig(
+	cfg config.Config,
+	settings providerSettings,
+	version string,
+	runtimeState *app.Runtime,
+) harness.HarnessConfig {
+	runtimeConfig := harness.HarnessConfig{
+		Name:           settings.kind,
+		Cwd:            cfg.Root,
+		ApprovalPolicy: "never",
+		Sandbox:        settings.sandbox,
+		Network:        false,
+		SessionsFile:   settings.sessionsFile,
+		Model:          settings.model,
+		Effort:         settings.effort,
+		LegacyEffort:   settings.legacyEffort,
+		ServiceMode:    settings.serviceMode,
+		Version:        version,
+		Stderr:         runtimeState.Writer("harness"),
+	}
+
+	command, commandErr := harness.ResolveConfiguredCommand(settings.kind, settings.acpCommand, nil)
+	if commandErr != nil {
+		if definition, ok := harness.Lookup(settings.kind); ok {
+			command = definition.Command
+		}
+	}
+
+	runtimeConfig.Command = command
+	runtimeConfig.Args = harness.CommandArgs(settings.kind, settings.acpArgs)
+
+	return runtimeConfig
+}
+
 func harnessSupervisorConfig(
 	cfg config.Config,
 	name string,
@@ -1122,48 +1203,7 @@ func harnessSupervisorConfig(
 	runtimeState *app.Runtime,
 	primary bool,
 ) harness.HarnessConfig {
-	customCommand := ""
-	var customArgs []string
-
-	runtimeConfig := harness.HarnessConfig{
-		Name:           name,
-		Cwd:            cfg.Root,
-		ApprovalPolicy: "never",
-		Sandbox:        cfg.Harness.Sandbox,
-		Network:        false,
-		SessionsFile:   cfg.HarnessSessionsPath(name),
-		Version:        version,
-		Stderr:         runtimeState.Writer("harness"),
-	}
-
-	// Preserve the complete historical configuration only for the primary
-	// communication/chat harness. Routed harnesses use their own provider
-	// defaults for inference properties until per-provider profiles exist.
-	if primary {
-		customCommand = cfg.Harness.ACPCommand
-		customArgs = cfg.Harness.ACPArgs
-		runtimeConfig.Model = cfg.Harness.Model
-		runtimeConfig.Effort = cfg.Harness.ReasoningEffort
-		runtimeConfig.LegacyEffort = cfg.Harness.UsesLegacyReasoningEffort()
-		runtimeConfig.ServiceMode = cfg.Harness.ServiceMode
-	} else if name == "acp" {
-		// There is currently one custom ACP command/argument configuration.
-		// Allow an explicitly routed custom ACP harness to reuse it.
-		customCommand = cfg.Harness.ACPCommand
-		customArgs = cfg.Harness.ACPArgs
-	}
-
-	command, commandErr := harness.ResolveConfiguredCommand(name, customCommand, nil)
-	if commandErr != nil {
-		if definition, ok := harness.Lookup(name); ok {
-			command = definition.Command
-		}
-	}
-
-	runtimeConfig.Command = command
-	runtimeConfig.Args = harness.CommandArgs(name, customArgs)
-
-	return runtimeConfig
+	return harnessProviderConfig(cfg, legacyProviderSettings(cfg, name, primary), version, runtimeState)
 }
 
 func harnessRuntimeSpec(cfg config.Config, version string, runtimeState *app.Runtime) harness.RuntimeSpec {
