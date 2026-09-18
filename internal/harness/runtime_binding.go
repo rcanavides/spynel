@@ -7,9 +7,9 @@ import (
 	"github.com/agent0ai/spynel/internal/core"
 )
 
-func (r *Runtime) roleLocked(role Role) supervisorOperations {
-	if provider := r.roles[role]; provider != nil {
-		return provider
+func (r *Runtime) roleLocked(role Role) providerRoute {
+	if route := r.roles[role]; route.provider != nil {
+		return route
 	}
 	return r.roles[RoleChat]
 }
@@ -18,7 +18,7 @@ func (t *runtimeTarget) current() supervisorOperations {
 	r := t.runtime
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.roleLocked(t.role)
+	return r.roleLocked(t.role).provider
 }
 
 // releaseBinding probes without the runtime mutex. A concurrent admission from
@@ -75,16 +75,16 @@ func (t *runtimeTarget) admit(key string) (*binding, error) {
 				b = nil
 			}
 		}
-		provider := r.roleLocked(t.role)
+		route := r.roleLocked(t.role)
 		if b != nil {
-			provider = b.provider
+			route = providerRoute{id: b.id, provider: b.provider}
 		}
-		if r.providerFencedLocked(provider) {
+		if r.providerFencedLocked(route.provider) {
 			r.mu.Unlock()
 			return nil, ErrProviderFenced
 		}
 		if b == nil || b.admitting == 0 {
-			b = &binding{provider: provider}
+			b = &binding{id: route.id, provider: route.provider}
 			r.bindings[key] = b
 		}
 		b.admitting++
@@ -129,7 +129,7 @@ func (t *runtimeTarget) reserved(key string, b *binding) (ProviderID, func(), er
 		release()
 		return "", nil, ErrProviderUnavailable
 	}
-	return ProviderID(b.provider.HarnessConfig().Name), release, nil
+	return b.id, release, nil
 }
 
 // ReserveExecution supports injected operational targets without lifecycle ownership.
@@ -173,16 +173,16 @@ func (t *runtimeTarget) admitted(key string, b *binding) {
 
 // owner resolves existing logical work independently of the current role map.
 // Unbound/inactive keys retain the ordinary current-provider behavior.
-func (t *runtimeTarget) owner(key string) (supervisorOperations, error) {
+func (t *runtimeTarget) owner(key string) (providerRoute, error) {
 	r := t.runtime
 	r.releaseBinding(key)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return nil, ErrProviderUnavailable
+		return providerRoute{}, ErrProviderUnavailable
 	}
 	if b := r.bindings[key]; b != nil {
-		return b.provider, nil
+		return providerRoute{id: b.id, provider: b.provider}, nil
 	}
 	return r.roleLocked(t.role), nil
 }
@@ -204,20 +204,20 @@ func (t *runtimeTarget) SendConversation(ctx context.Context, key, prompt, messa
 	return b.provider.SendConversation(ctx, key, prompt, message, emit)
 }
 func (t *runtimeTarget) SendControl(ctx context.Context, key string, request ControlRequest) (ControlResult, error) {
-	s, err := t.owner(key)
+	route, err := t.owner(key)
 	if err != nil {
 		return ControlResult{}, err
 	}
 	defer t.runtime.releaseBinding(key)
-	return s.SendControl(ctx, key, request)
+	return route.provider.SendControl(ctx, key, request)
 }
 func (t *runtimeTarget) Interrupt(ctx context.Context, key string) (bool, error) {
-	s, err := t.owner(key)
+	route, err := t.owner(key)
 	if err != nil {
 		return false, err
 	}
 	defer t.runtime.releaseBinding(key)
-	return s.Interrupt(ctx, key)
+	return route.provider.Interrupt(ctx, key)
 }
 func (t *runtimeTarget) ResetSession(key string) error {
 	r := t.runtime
@@ -227,10 +227,11 @@ func (t *runtimeTarget) ResetSession(key string) error {
 		r.mu.Unlock()
 		return ErrProviderUnavailable
 	}
-	s := r.roleLocked(t.role)
+	route := r.roleLocked(t.role)
 	if b := r.bindings[key]; b != nil {
-		s = b.provider
+		route = providerRoute{id: b.id, provider: b.provider}
 	}
+	s := route.provider
 	var entry *providerEntry
 	for _, p := range r.providers {
 		if p.supervisor == s {
@@ -257,22 +258,22 @@ func (t *runtimeTarget) ResetSession(key string) error {
 	return s.ResetSession(key)
 }
 func (t *runtimeTarget) IsActive(key string) bool {
-	s, err := t.owner(key)
-	return err == nil && s.IsActive(key)
+	route, err := t.owner(key)
+	return err == nil && route.provider.IsActive(key)
 }
 func (t *runtimeTarget) ThreadID(key string) string {
-	s, err := t.owner(key)
+	route, err := t.owner(key)
 	if err != nil {
 		return ""
 	}
-	return s.ThreadID(key)
+	return route.provider.ThreadID(key)
 }
 func (t *runtimeTarget) ConversationAdmission(key string) string {
-	s, err := t.owner(key)
+	route, err := t.owner(key)
 	if err != nil {
 		return "new"
 	}
-	return s.ConversationAdmission(key)
+	return route.provider.ConversationAdmission(key)
 }
 func (t *runtimeTarget) usingCurrent() (supervisorOperations, func(), error) {
 	r := t.runtime
@@ -281,7 +282,7 @@ func (t *runtimeTarget) usingCurrent() (supervisorOperations, func(), error) {
 	if r.closed {
 		return nil, nil, ErrProviderUnavailable
 	}
-	s := r.roleLocked(t.role)
+	s := r.roleLocked(t.role).provider
 	for _, p := range r.providers {
 		if p.supervisor == s {
 			if p.fenced {
@@ -304,7 +305,7 @@ func (t *runtimeTarget) Models(ctx context.Context) ([]Model, error) {
 func (t *runtimeTarget) Available() (bool, string) {
 	r := t.runtime
 	r.mu.Lock()
-	p := r.roleLocked(t.role)
+	p := r.roleLocked(t.role).provider
 	blocked := r.closed || r.providerFencedLocked(p)
 	r.mu.Unlock()
 	if blocked {
@@ -350,11 +351,11 @@ func (t *runtimeTarget) waitAdmission(ctx context.Context, key string) (*binding
 
 // ExecutionProvider reports the pinned owner while a reservation or turn is live.
 func (t *runtimeTarget) ExecutionProvider(key string) ProviderID {
-	s, err := t.owner(key)
+	route, err := t.owner(key)
 	if err != nil {
 		return ""
 	}
-	return ProviderID(s.HarnessConfig().Name)
+	return route.id
 }
 func ExecutionProvider(target ExecutionTarget, key string) ProviderID {
 	if p, ok := target.(interface{ ExecutionProvider(string) ProviderID }); ok {

@@ -11,7 +11,9 @@ import (
 	"strings"
 )
 
-// ProviderID is a normalized catalog name, never a profile or generation.
+// ProviderID is the normalized provider instance identity from the topology
+// map key. It is never a profile or generation. HarnessConfig.Name remains the
+// harness/catalog kind, so multiple provider instances may share one kind.
 type ProviderID string
 
 type RuntimeSpec struct {
@@ -20,6 +22,7 @@ type RuntimeSpec struct {
 }
 
 type providerEntry struct {
+	id         ProviderID
 	supervisor *Supervisor
 	operations int
 	fenced     bool // structural work or retirement; protected by Runtime.mu
@@ -29,11 +32,18 @@ type providerEntry struct {
 func normalizeSpec(spec RuntimeSpec) (RuntimeSpec, error) {
 	out := RuntimeSpec{Providers: make(map[ProviderID]HarnessConfig), Roles: make(map[Role]ProviderID)}
 	paths := make(map[string]ProviderID)
+	chatID := ProviderID(strings.ToLower(strings.TrimSpace(string(spec.Roles[RoleChat]))))
 	for id, cfg := range spec.Providers {
 		id = ProviderID(strings.ToLower(strings.TrimSpace(string(id))))
 		cfg.Name = strings.ToLower(strings.TrimSpace(cfg.Name))
-		if cfg.Name != string(id) {
-			return out, fmt.Errorf("provider identity mismatch: %q", id)
+		// An identity may only stay empty as the legacy no-harness-selected
+		// marker (empty instance, empty kind) so a harness-less service stays
+		// constructible; every other empty side is an explicit error.
+		if id == "" && cfg.Name != "" {
+			return out, errors.New("provider identity is empty")
+		}
+		if id != "" && cfg.Name == "" {
+			return out, fmt.Errorf("provider %q has an empty harness name", id)
 		}
 		if _, ok := out.Providers[id]; ok {
 			return out, fmt.Errorf("duplicate provider: %q", id)
@@ -49,7 +59,7 @@ func normalizeSpec(spec RuntimeSpec) (RuntimeSpec, error) {
 			}
 			paths[path] = id
 		}
-		if id == "acp" && ProviderID(strings.ToLower(strings.TrimSpace(string(spec.Roles[RoleChat])))) != id && strings.TrimSpace(cfg.Command) == "" {
+		if cfg.Name == "acp" && chatID != id && strings.TrimSpace(cfg.Command) == "" {
 			return out, errors.New("custom ACP requires a command")
 		}
 		cfg.Args = append([]string(nil), cfg.Args...)
@@ -74,9 +84,9 @@ func NewRuntimeSpec(registry *Registry, spec RuntimeSpec) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Runtime{registry: registry, providers: make(map[ProviderID]*providerEntry), roles: make(map[Role]supervisorOperations), targets: make(map[Role]*runtimeTarget), bindings: make(map[string]*binding), changed: make(chan struct{}), ready: make(chan struct{}, 1)}
+	r := &Runtime{registry: registry, providers: make(map[ProviderID]*providerEntry), roles: make(map[Role]providerRoute), targets: make(map[Role]*runtimeTarget), bindings: make(map[string]*binding), changed: make(chan struct{}), ready: make(chan struct{}, 1)}
 	for id, cfg := range spec.Providers {
-		r.providers[id] = &providerEntry{supervisor: NewSupervisor(registry, cfg), stop: make(chan struct{})}
+		r.providers[id] = &providerEntry{id: id, supervisor: NewSupervisor(registry, cfg), stop: make(chan struct{})}
 	}
 	r.publishRolesLocked(spec.Roles)
 	for _, p := range r.providers {
@@ -85,9 +95,9 @@ func NewRuntimeSpec(registry *Registry, spec RuntimeSpec) (*Runtime, error) {
 	return r, nil
 }
 func (r *Runtime) publishRolesLocked(roles map[Role]ProviderID) {
-	r.roles = make(map[Role]supervisorOperations, len(roles))
+	r.roles = make(map[Role]providerRoute, len(roles))
 	for role, id := range roles {
-		r.roles[role] = r.providers[id].supervisor
+		r.roles[role] = providerRoute{id: id, provider: r.providers[id].supervisor}
 	}
 	r.supervisor = r.providers[roles[RoleChat]].supervisor
 }
@@ -333,7 +343,7 @@ func (r *Runtime) Reconcile(ctx context.Context, spec RuntimeSpec) error {
 		if next[id] != nil {
 			continue
 		}
-		p := &providerEntry{supervisor: NewSupervisor(r.registry, cfg), stop: make(chan struct{})}
+		p := &providerEntry{id: id, supervisor: NewSupervisor(r.registry, cfg), stop: make(chan struct{})}
 		added[id] = p
 		next[id] = p
 		if lifetime != nil {

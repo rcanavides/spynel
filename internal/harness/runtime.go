@@ -25,7 +25,7 @@ type Runtime struct {
 	supervisor *Supervisor // current chat provider; compatibility for local fixtures
 	mu         sync.Mutex
 	providers  map[ProviderID]*providerEntry
-	roles      map[Role]supervisorOperations
+	roles      map[Role]providerRoute
 	targets    map[Role]*runtimeTarget
 	bindings   map[string]*binding
 	closed     bool
@@ -36,11 +36,22 @@ type Runtime struct {
 	version    uint64
 }
 
-// A binding retains the actual provider Supervisor, rather than re-resolving a
-// role. Its catalog identity is Supervisor.HarnessConfig().Name. Keeping the
-// reference also preserves Commit 2's single-Supervisor structural replacement.
+// providerRoute retains the concrete owner behind one role mapping: the
+// provider instance identity from the topology key plus its Supervisor. The
+// instance ID stays the admission identity even when several instances share
+// one harness kind.
+type providerRoute struct {
+	id       ProviderID
+	provider supervisorOperations
+}
+
+// A binding retains the exact provider instance that admitted an execution:
+// its topology instance ID plus the actual Supervisor, rather than
+// re-resolving a role. Keeping both references preserves exact attribution
+// across role remaps and Commit 2's single-Supervisor structural replacement.
 // Supervisor.IsActive is the sole authority for logical execution lifetime.
 type binding struct {
+	id        ProviderID
 	provider  supervisorOperations
 	admitting int
 }

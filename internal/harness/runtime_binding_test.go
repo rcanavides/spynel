@@ -32,8 +32,10 @@ func bindingRuntime(t *testing.T, a Harness) (*Runtime, *Supervisor, *changeHarn
 	return r, bs, b
 }
 func remapBindingRole(r *Runtime, role Role, s supervisorOperations) {
+	// Test-only direct injection: fixture supervisors have no separate
+	// topology instance, so their harness name is the instance identity.
 	r.mu.Lock()
-	r.roles[role] = s
+	r.roles[role] = providerRoute{id: ProviderID(s.HarnessConfig().Name), provider: s}
 	r.mu.Unlock()
 }
 func bindingCount(r *Runtime) int { r.mu.Lock(); defer r.mu.Unlock(); return len(r.bindings) }
