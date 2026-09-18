@@ -286,6 +286,44 @@ func TestTaskDetailUsesGlobalReviewModeInsteadOfStaleDocumentChoice(t *testing.T
 	}
 }
 
+func TestWorkflowItemFormattingDisplaysBlockedProvider(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 15, 0, 0, 0, time.UTC)
+	item := orchestrator.WorkflowItem{
+		Kind: "task", Title: "Blocked task", Status: "working", UpdatedAt: now.Add(-5 * time.Minute),
+		DetailsAvailable: true, Step: "Waiting for execution.", Blocked: orchestrator.LeaseBlockedProviderUnavailable,
+		BlockedSince: now.Add(-12 * time.Minute),
+	}
+	output := strings.Join(formatWorkflowItem(item, false, now), "\n")
+	if !strings.Contains(output, "blocked: provider unavailable (developer) for 12m") {
+		t.Fatalf("blocked workflow marker missing:\n%s", output)
+	}
+}
+
+func TestWorkflowItemFormattingPreservesUnknownBlockedReason(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 15, 0, 0, 0, time.UTC)
+	item := orchestrator.WorkflowItem{
+		Kind: "goal", Title: "Future block", Status: "planning", UpdatedAt: now,
+		DetailsAvailable: true, Blocked: "future_reason",
+	}
+	output := strings.Join(formatWorkflowItem(item, false, now), "\n")
+	if !strings.Contains(output, `blocked: future\_reason (developer)`) {
+		t.Fatalf("unknown blocked reason was hidden:\n%s", output)
+	}
+}
+
+func TestWorkflowItemFormattingUnblockedOutputUnchanged(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 15, 0, 0, 0, time.UTC)
+	item := orchestrator.WorkflowItem{
+		Kind: "task", Title: "Normal task", Status: "working", UpdatedAt: now.Add(-5 * time.Minute),
+		Attempt: 2, DetailsAvailable: true, Step: "Doing work.",
+	}
+	got := strings.Join(formatWorkflowItem(item, false, now), "\n")
+	want := "- **Normal task**  \n  working · updated 5m ago · 2↻ · step: Doing work."
+	if got != want {
+		t.Fatalf("unblocked workflow output changed:\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func writeWorkflowListFixture(t *testing.T, cfg config.Config, kind, status, name string, front map[string]any, body string) {
 	t.Helper()
 	path := cfg.StatePath(kind, status, name)

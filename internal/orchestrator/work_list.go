@@ -36,6 +36,8 @@ type WorkflowItem struct {
 	ReviewRequired     bool
 	HasReviewPolicy    bool
 	DetailsAvailable   bool
+	Blocked            string
+	BlockedSince       time.Time
 }
 
 // WorkflowInventory is a bounded durable task or goal census. Diagnostics are
@@ -51,6 +53,20 @@ type WorkflowInventory struct {
 // following document symlinks. It returns at most maxStatusDocuments entries.
 func (m *Manager) WorkflowItems(kind string) WorkflowInventory {
 	result := WorkflowInventory{}
+	leases, leaseErr := m.loadLeases()
+	if leaseErr != nil {
+		addStatusDiagnostic(&result.Diagnostics, fmt.Sprintf("%s blocked state is unavailable", kind))
+	}
+	leaseByDocument := make(map[string]Lease)
+	for _, lease := range leases {
+		if lease.Route != kind {
+			continue
+		}
+		name := filepath.Base(lease.File)
+		if _, exists := leaseByDocument[name]; !exists {
+			leaseByDocument[name] = lease
+		}
+	}
 	var routeFound bool
 	cfg := m.runtimeSnapshot()
 	for _, route := range workflowRoutes() {
@@ -85,6 +101,10 @@ func (m *Manager) WorkflowItems(kind string) WorkflowInventory {
 				inspected++
 				path := filepath.Join(base, status, entry.Name())
 				item := WorkflowItem{Kind: strings.TrimSuffix(kind, "s"), Status: status, FileName: entry.Name()}
+				if lease, ok := leaseByDocument[entry.Name()]; ok && lease.Blocked != nil {
+					item.Blocked = lease.Blocked.Reason
+					item.BlockedSince = lease.Blocked.Since
+				}
 				item.Title = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
 				info, statErr := os.Lstat(path)
 				if statErr == nil {

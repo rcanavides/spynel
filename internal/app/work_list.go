@@ -272,6 +272,20 @@ func formatWorkflowItem(item orchestrator.WorkflowItem, detail bool, now time.Ti
 		}
 		parts = append(parts, "updated "+shortDuration(age)+" ago")
 	}
+	if item.Blocked != "" {
+		blocked := "blocked: " + workflowBlockedReason(item.Blocked)
+		if role := workflowBlockedRole(item.Kind, item.Status); role != "" {
+			blocked += " (" + role + ")"
+		}
+		if !item.BlockedSince.IsZero() {
+			age := now.Sub(item.BlockedSince)
+			if age < 0 {
+				age = 0
+			}
+			blocked += " for " + shortDuration(age)
+		}
+		parts = append(parts, blocked)
+	}
 	if item.Kind == "goal" {
 		parts = append(parts, fmt.Sprintf("round %d", item.Round))
 		if item.RoundTasks > 0 {
@@ -338,6 +352,32 @@ func formatWorkflowItem(item orchestrator.WorkflowItem, detail bool, now time.Ti
 		}
 	}
 	return lines
+}
+
+func workflowBlockedReason(reason string) string {
+	if reason == orchestrator.LeaseBlockedProviderUnavailable {
+		return "provider unavailable"
+	}
+	if reason = safeJobText(reason, 80); reason != "" {
+		return reason
+	}
+	return "unknown"
+}
+
+func workflowBlockedRole(kind, status string) string {
+	switch status {
+	case "review", "reviewing":
+		return "reviewer"
+	case "todo", "working":
+		if kind == "task" {
+			return "developer"
+		}
+	case "proposed", "planning":
+		if kind == "goal" {
+			return "developer"
+		}
+	}
+	return ""
 }
 
 func workflowStatusStep(kind, status string) string {

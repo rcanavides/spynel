@@ -69,6 +69,83 @@ func TestWorkflowItemsUsesFolderStateAndDoesNotFollowDocumentSymlinks(t *testing
 	}
 }
 
+func TestWorkflowItemsExposesOnlyMatchingBlockedLeaseMetadata(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedSince := time.Date(2026, time.September, 18, 14, 30, 0, 0, time.UTC)
+	updatedAt := blockedSince.Add(-time.Hour)
+	paths := map[string]string{}
+	for _, fixture := range []struct {
+		name  string
+		id    string
+		front map[string]any
+	}{
+		{name: "blocked.md", id: "task-blocked"},
+		{name: "unblocked.md", id: "task-unblocked"},
+		{name: "no-lease.md", id: "task-no-lease", front: map[string]any{"blocked": LeaseBlockedProviderUnavailable, "blocked_reason": "spoofed"}},
+	} {
+		path := cfg.StatePath("tasks", "working", fixture.name)
+		front := map[string]any{
+			"id": fixture.id, "title": fixture.id, "status": "working", "review_required": true,
+			"created_at": updatedAt.Add(-time.Hour).Format(time.RFC3339), "updated_at": updatedAt.Format(time.RFC3339),
+		}
+		for key, value := range fixture.front {
+			front[key] = value
+		}
+		if err := WriteDocument(path, Document{FrontMatter: front, Body: "## Progress\n\n- Waiting for the provider.\n"}); err != nil {
+			t.Fatal(err)
+		}
+		paths[fixture.id] = path
+	}
+
+	manager := New(cfg, &heartbeatHarness{}, extensions.Runner{})
+	if err := manager.saveLease(Lease{
+		ID: "blocked-lease", Route: "tasks", File: paths["task-blocked"], SessionKey: "blocked-session", State: "processing",
+		StartedAt: updatedAt, HeartbeatAt: updatedAt,
+		Blocked: &LeaseBlock{Reason: LeaseBlockedProviderUnavailable, Since: blockedSince},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.saveLease(Lease{
+		ID: "unblocked-lease", Route: "tasks", File: paths["task-unblocked"], SessionKey: "unblocked-session", State: "processing",
+		StartedAt: updatedAt.Add(time.Minute), HeartbeatAt: updatedAt, LastError: "provider unavailable",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.saveLease(Lease{
+		ID: "other-route-lease", Route: "goals", File: paths["task-no-lease"], SessionKey: "other-route-session", State: "processing",
+		StartedAt: updatedAt.Add(2 * time.Minute), HeartbeatAt: updatedAt,
+		Blocked: &LeaseBlock{Reason: LeaseBlockedProviderUnavailable, Since: blockedSince.Add(time.Minute)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	inventory := manager.WorkflowItems("tasks")
+	if len(inventory.Items) != 3 {
+		t.Fatalf("workflow items = %#v", inventory.Items)
+	}
+	items := make(map[string]WorkflowItem, len(inventory.Items))
+	for _, item := range inventory.Items {
+		items[item.ID] = item
+	}
+	blocked := items["task-blocked"]
+	if blocked.Blocked != LeaseBlockedProviderUnavailable || !blocked.BlockedSince.Equal(blockedSince) {
+		t.Fatalf("blocked workflow metadata = %#v", blocked)
+	}
+	for _, id := range []string{"task-unblocked", "task-no-lease"} {
+		item := items[id]
+		if item.Blocked != "" || !item.BlockedSince.IsZero() {
+			t.Fatalf("%s inherited blocked metadata: %#v", id, item)
+		}
+	}
+}
+
 func containsWorkflowStatus(statuses []string, wanted string) bool {
 	for _, status := range statuses {
 		if status == wanted {
