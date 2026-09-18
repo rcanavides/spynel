@@ -2413,6 +2413,271 @@ func TestHarnessRuntimeSpecNoHarnessSentinel(t *testing.T) {
 	}
 }
 
+func TestHarnessRuntimeSpecNamedInstances(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Sandbox = "danger-full-access"
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer:    "codex-dev",
+		Reviewer:     "claude-rev",
+		Notification: "claude-arch",
+	}
+	cfg.Harness.Providers = map[string]config.ProviderProfile{
+		"codex-dev":   {Harness: "codex", Model: "DEV-MODEL", ReasoningEffort: "high", ServiceMode: "priority", Sandbox: "workspace-write"},
+		"claude-rev":  {Harness: "claude-code", Model: "REV-MODEL", ReasoningEffort: "high", Sandbox: "read-only"},
+		"claude-arch": {Harness: "claude-code", Model: "ARCH-MODEL", Sandbox: ""},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("named instance configuration rejected: %v", err)
+	}
+
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "named-instances-spec")
+	defer runtimeState.Close()
+
+	spec := harnessRuntimeSpec(cfg, "test", runtimeState)
+
+	expectedRoles := map[harness.Role]harness.ProviderID{
+		harness.RoleChat:         "agent-zero",
+		harness.RoleDeveloper:    "codex-dev",
+		harness.RoleReviewer:     "claude-rev",
+		harness.RoleNotification: "claude-arch",
+		harness.RoleHeartbeat:    "agent-zero",
+	}
+	if !reflect.DeepEqual(spec.Roles, expectedRoles) {
+		t.Fatalf("roles = %#v, want %#v", spec.Roles, expectedRoles)
+	}
+	if len(spec.Providers) != 4 {
+		t.Fatalf("providers = %#v, want exactly the referenced instances plus primary", spec.Providers)
+	}
+
+	// Instance IDs differ from their harness kinds, and the two same-kind
+	// claude instances stay independent instead of collapsing into one
+	// identity reconstructed from HarnessConfig.Name.
+	revConfig, revOK := spec.Providers["claude-rev"]
+	archConfig, archOK := spec.Providers["claude-arch"]
+	if !revOK || !archOK {
+		t.Fatalf("claude instances missing: %#v", spec.Providers)
+	}
+	if revConfig.Name != "claude-code" || archConfig.Name != "claude-code" {
+		t.Fatalf("claude kinds = %q / %q", revConfig.Name, archConfig.Name)
+	}
+	if revConfig.Model != "REV-MODEL" || archConfig.Model != "ARCH-MODEL" {
+		t.Fatalf("same-kind models collided: %q / %q", revConfig.Model, archConfig.Model)
+	}
+	if revConfig.Effort != "high" || revConfig.LegacyEffort {
+		t.Fatalf("claude-rev effort = %q (legacy %t)", revConfig.Effort, revConfig.LegacyEffort)
+	}
+	if archConfig.Effort != "" || archConfig.ServiceMode != "" {
+		t.Fatalf("claude-arch inherited settings it did not declare: %+v", archConfig)
+	}
+
+	devConfig, devOK := spec.Providers["codex-dev"]
+	if !devOK {
+		t.Fatalf("codex-dev missing: %#v", spec.Providers)
+	}
+	if devConfig.Name != "codex" || devConfig.Model != "DEV-MODEL" || devConfig.Effort != "high" || devConfig.ServiceMode != "priority" {
+		t.Fatalf("codex-dev composition = %+v", devConfig)
+	}
+	// Explicit profile sandboxes override the global value; an empty profile
+	// sandbox inherits it.
+	if devConfig.Sandbox != "workspace-write" || revConfig.Sandbox != "read-only" {
+		t.Fatalf("explicit profile sandboxes = %q / %q", devConfig.Sandbox, revConfig.Sandbox)
+	}
+	if archConfig.Sandbox != "danger-full-access" {
+		t.Fatalf("empty profile sandbox did not inherit the global value: %q", archConfig.Sandbox)
+	}
+
+	// The primary keeps its legacy composition, and no named profile inherits
+	// primary inference settings.
+	primaryConfig := spec.Providers["agent-zero"]
+	if primaryConfig.Name != "agent-zero" || primaryConfig.Model != "" || primaryConfig.SessionsFile != cfg.HarnessSessionsPath("agent-zero") {
+		t.Fatalf("primary composition = %+v", primaryConfig)
+	}
+
+	// Named profiles use distinct instance-scoped session paths while the
+	// primary retains the legacy shared file.
+	codexDevProfile := cfg.Harness.Providers["codex-dev"]
+	if devConfig.SessionsFile != cfg.ProviderSessionsPath(config.ProviderRef{ID: "codex-dev", Kind: "codex", Profile: &codexDevProfile}) {
+		t.Fatalf("codex-dev sessions file = %q", devConfig.SessionsFile)
+	}
+	if revConfig.SessionsFile != filepath.Join(root, ".spynel", "runtime", "providers", "claude-rev", "harness-claude-code-sessions.json") {
+		t.Fatalf("claude-rev sessions file = %q", revConfig.SessionsFile)
+	}
+	if archConfig.SessionsFile != filepath.Join(root, ".spynel", "runtime", "providers", "claude-arch", "harness-claude-code-sessions.json") {
+		t.Fatalf("claude-arch sessions file = %q", archConfig.SessionsFile)
+	}
+	if revConfig.SessionsFile == archConfig.SessionsFile || filepath.Dir(revConfig.SessionsFile) == filepath.Dir(archConfig.SessionsFile) {
+		t.Fatal("same-kind profiles share a session directory")
+	}
+
+	// Rebuilding after a global sandbox change updates only profiles that
+	// inherit the global sandbox.
+	cfg.Harness.Sandbox = "workspace-write"
+	next := harnessRuntimeSpec(cfg, "test", runtimeState)
+	if got := next.Providers["claude-arch"].Sandbox; got != "workspace-write" {
+		t.Fatalf("inheriting profile sandbox after global change = %q", got)
+	}
+	if got := next.Providers["claude-rev"].Sandbox; got != "read-only" {
+		t.Fatalf("explicit profile sandbox after global change = %q", got)
+	}
+
+	runtime, err := harness.NewRuntimeSpec(harness.NewBuiltinRegistry(), spec)
+	if err != nil {
+		t.Fatalf("named instance spec rejected by NewRuntimeSpec: %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHarnessRuntimeSpecProfileUnusedNotComposed(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Providers = map[string]config.ProviderProfile{
+		"glm-dev": {Harness: "opencode", Model: "UNUSED-MODEL"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unused profile configuration rejected: %v", err)
+	}
+
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "unused-profile-spec")
+	defer runtimeState.Close()
+
+	spec := harnessRuntimeSpec(cfg, "test", runtimeState)
+
+	if len(spec.Providers) != 1 {
+		t.Fatalf("unused profile composed into RuntimeSpec: %#v", spec.Providers)
+	}
+	if _, ok := spec.Providers["glm-dev"]; ok {
+		t.Fatal("unused profile instance composed into RuntimeSpec")
+	}
+	for _, id := range spec.Roles {
+		if id == "glm-dev" {
+			t.Fatal("unused profile referenced by a role")
+		}
+	}
+	if _, ok := spec.Providers["opencode"]; ok {
+		t.Fatal("unused profile kind composed into RuntimeSpec")
+	}
+}
+
+func TestHarnessRuntimeSpecProfileACP(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "codex"
+	// The global legacy ACP settings exist but must not be consumed by named
+	// ACP profiles; a missing global command proves the profiles resolve their
+	// own command instead of falling back to the global value.
+	cfg.Harness.ACPCommand = "missing-global-agent"
+	cfg.Harness.ACPArgs = []string{"global-arg"}
+	cfg.Harness.Providers = map[string]config.ProviderProfile{
+		"acp-one": {Harness: "acp", ACPCommand: executable, ACPArgs: []string{"--one", "alpha"}},
+		"acp-two": {Harness: "acp", ACPCommand: executable, ACPArgs: []string{"--two", "beta"}},
+	}
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer: "acp-one",
+		Reviewer:  "acp-two",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("named ACP profile configuration rejected: %v", err)
+	}
+
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "profile-acp-spec")
+	defer runtimeState.Close()
+
+	spec := harnessRuntimeSpec(cfg, "test", runtimeState)
+
+	one, oneOK := spec.Providers["acp-one"]
+	two, twoOK := spec.Providers["acp-two"]
+	if !oneOK || !twoOK {
+		t.Fatalf("named ACP instances missing: %#v", spec.Providers)
+	}
+	for name, entry := range map[string]harness.HarnessConfig{"acp-one": one, "acp-two": two} {
+		if entry.Name != "acp" {
+			t.Fatalf("%s kind = %q", name, entry.Name)
+		}
+		if entry.Command != expectedLegacyHarnessCommand("acp", executable) {
+			t.Fatalf("%s consumed the global command: %q", name, entry.Command)
+		}
+		if strings.Contains(strings.Join(entry.Args, " "), "global-arg") {
+			t.Fatalf("%s consumed the global args: %#v", name, entry.Args)
+		}
+	}
+	if !reflect.DeepEqual(one.Args, []string{"--one", "alpha"}) || !reflect.DeepEqual(two.Args, []string{"--two", "beta"}) {
+		t.Fatalf("named ACP args = %#v / %#v", one.Args, two.Args)
+	}
+	if one.SessionsFile == two.SessionsFile || filepath.Dir(one.SessionsFile) == filepath.Dir(two.SessionsFile) {
+		t.Fatalf("named ACP instances share a session directory: %q / %q", one.SessionsFile, two.SessionsFile)
+	}
+
+	// The profile argument lists are copied, not aliased into the spec.
+	one.Args[0] = "mutated"
+	if cfg.Harness.Providers["acp-one"].ACPArgs[0] != "--one" {
+		t.Fatal("profile ACP arguments were mutated during composition")
+	}
+}
+
+func TestHarnessRuntimeSpecProfileSharedByRoles(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Providers = map[string]config.ProviderProfile{
+		"glm-dev": {Harness: "codex", Model: "SHARED-MODEL"},
+	}
+	cfg.Harness.Routing = &config.HarnessRouting{
+		Developer: "glm-dev",
+		Reviewer:  "glm-dev",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("shared profile routing rejected: %v", err)
+	}
+
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "shared-profile-spec")
+	defer runtimeState.Close()
+
+	spec := harnessRuntimeSpec(cfg, "test", runtimeState)
+
+	if len(spec.Providers) != 2 {
+		t.Fatalf("shared profile duplicated: %#v", spec.Providers)
+	}
+	if got := spec.Roles[harness.RoleDeveloper]; got != "glm-dev" || spec.Roles[harness.RoleReviewer] != "glm-dev" {
+		t.Fatalf("roles = %q / %q, want glm-dev for both", spec.Roles[harness.RoleDeveloper], spec.Roles[harness.RoleReviewer])
+	}
+	if entry := spec.Providers["glm-dev"]; entry.Name != "codex" || entry.Model != "SHARED-MODEL" {
+		t.Fatalf("shared provider composition = %+v", entry)
+	}
+}
+
 func targetHarnessConfig(target harness.ExecutionTarget) harness.HarnessConfig {
 	return target.(interface{ HarnessConfig() harness.HarnessConfig }).HarnessConfig()
 }

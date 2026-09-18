@@ -105,17 +105,53 @@ func TestProviderForRole(t *testing.T) {
 		t.Fatalf("legacy kind route = %+v", ref)
 	}
 
-	// A declared profile ID resolves its named instance. The harness is
-	// constructed directly because production routing validation still
-	// rejects profile IDs until profile composition lands.
+	// A declared profile ID resolves its named instance.
 	cfg.Harness.Routing = &HarnessRouting{Developer: "claude-arch"}
 	ref := cfg.Harness.ProviderForRole(providerharness.RoleDeveloper)
 	if ref.ID != "claude-arch" || ref.Kind != "claude-code" || ref.Profile == nil || ref.Profile.Harness != "claude-code" {
 		t.Fatalf("profile route = %+v", ref)
 	}
 
-	// Production routing validation still accepts only catalog kinds.
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "harness.routing.developer is not a supported coding harness") {
-		t.Fatalf("profile routing validation = %v", err)
+	// Profile routing is now valid: the profile's harness kind satisfies the
+	// same catalog restriction as a legacy kind route.
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("profile routing rejected: %v", err)
+	}
+}
+
+func TestHarnessRoutingAcceptsProviderProfiles(t *testing.T) {
+	cfg := Default()
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Providers = map[string]ProviderProfile{
+		"codex-dev":  {Harness: "codex", ReasoningEffort: "high"},
+		"acp-runner": {Harness: "acp", ACPCommand: "own-agent", ACPArgs: []string{"--stdio"}},
+	}
+	cfg.Harness.Routing = &HarnessRouting{
+		Developer: "codex-dev",
+		Reviewer:  "codex-dev",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("provider profile routing rejected: %v", err)
+	}
+
+	// A named ACP profile carries its own command: the legacy global
+	// harness.acp_command requirement must not fire for profile routes.
+	cfg.Harness.Routing = &HarnessRouting{Notification: "acp-runner"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("named ACP profile routing rejected without global acp_command: %v", err)
+	}
+
+	// A profile whose harness kind fails the same catalog restriction keeps
+	// a role-attributed error even though profile validation flags it too.
+	cfg.Harness.Providers["broken-dev"] = ProviderProfile{Harness: "not-a-harness"}
+	cfg.Harness.Routing = &HarnessRouting{Developer: "broken-dev"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "harness.routing.developer selects provider profile broken-dev whose harness is not a supported coding harness") {
+		t.Fatalf("invalid profile kind route = %v", err)
+	}
+
+	// Values that are neither a declared profile ID nor a catalog kind fail.
+	cfg.Harness.Routing = &HarnessRouting{Reviewer: "ghost-dev"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "harness.routing.reviewer is not a supported coding harness") {
+		t.Fatalf("unknown route = %v", err)
 	}
 }

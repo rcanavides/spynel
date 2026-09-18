@@ -509,6 +509,16 @@ func (c Config) Validate() error {
 			if route.value == "" {
 				continue
 			}
+			// A declared profile ID routes its named instance. The profile's
+			// harness kind must satisfy the same catalog restriction as a
+			// legacy route, and the profile's own ACP command applies instead
+			// of the global legacy configuration.
+			if profile, ok := c.Harness.Providers[route.value]; ok {
+				if _, kindOK := harness.Lookup(profile.Harness); !kindOK {
+					problems = append(problems, "harness.routing."+route.name+" selects provider profile "+route.value+" whose harness is not a supported coding harness")
+				}
+				continue
+			}
 			if route.value == "acp" {
 				routedACP = true
 			}

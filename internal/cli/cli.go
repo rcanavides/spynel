@@ -1159,6 +1159,39 @@ func legacyProviderSettings(cfg config.Config, kind string, primary bool) provid
 	return settings
 }
 
+// profileProviderSettings resolves one named provider profile reference into
+// provider settings. Profiles carry their own inference and ACP values; an
+// empty profile sandbox inherits the global harness sandbox. The argument
+// list is never mutated: harnessProviderConfig copies it through the
+// existing CommandArgs path.
+func profileProviderSettings(cfg config.Config, ref config.ProviderRef) providerSettings {
+	profile := *ref.Profile
+	settings := providerSettings{
+		kind:         ref.Kind,
+		model:        profile.Model,
+		effort:       profile.ReasoningEffort,
+		serviceMode:  profile.ServiceMode,
+		sandbox:      profile.Sandbox,
+		acpCommand:   profile.ACPCommand,
+		acpArgs:      profile.ACPArgs,
+		sessionsFile: cfg.ProviderSessionsPath(ref),
+	}
+	if settings.sandbox == "" {
+		settings.sandbox = cfg.Harness.Sandbox
+	}
+	return settings
+}
+
+// providerSettingsFor resolves the settings for one provider reference:
+// named profiles use their own values with global sandbox inheritance, while
+// legacy references keep the exact primary/routed composition behavior.
+func providerSettingsFor(cfg config.Config, ref config.ProviderRef, primary bool) providerSettings {
+	if ref.Profile != nil {
+		return profileProviderSettings(cfg, ref)
+	}
+	return legacyProviderSettings(cfg, ref.Kind, primary)
+}
+
 // harnessProviderConfig builds the provider-neutral HarnessConfig shared by
 // primary and routed providers. It owns only composition logic common to
 // both paths; every policy remains exactly as before.
@@ -1207,18 +1240,16 @@ func harnessSupervisorConfig(
 }
 
 func harnessRuntimeSpec(cfg config.Config, version string, runtimeState *app.Runtime) harness.RuntimeSpec {
-	primary := strings.ToLower(strings.TrimSpace(cfg.Harness.Name))
-	spec := harness.RuntimeSpec{Providers: make(map[harness.ProviderID]harness.HarnessConfig), Roles: map[harness.Role]harness.ProviderID{harness.RoleChat: harness.ProviderID(primary)}}
-	spec.Providers[harness.ProviderID(primary)] = harnessSupervisorConfig(cfg, primary, version, runtimeState, true)
-	for _, role := range []harness.Role{harness.RoleDeveloper, harness.RoleReviewer, harness.RoleNotification, harness.RoleHeartbeat} {
-		name := strings.ToLower(strings.TrimSpace(cfg.Harness.NameForRole(role)))
-		if name == "" {
-			name = primary
-		}
-		id := harness.ProviderID(name)
+	spec := harness.RuntimeSpec{Providers: make(map[harness.ProviderID]harness.HarnessConfig), Roles: make(map[harness.Role]harness.ProviderID)}
+	// Chat resolves first so a role inheriting the primary instance reuses the
+	// primary composition. Only instances actually referenced by chat or one
+	// of the current roles are composed; unused profiles stay out entirely.
+	for _, role := range []harness.Role{harness.RoleChat, harness.RoleDeveloper, harness.RoleReviewer, harness.RoleNotification, harness.RoleHeartbeat} {
+		ref := cfg.Harness.ProviderForRole(role)
+		id := harness.ProviderID(ref.ID)
 		spec.Roles[role] = id
 		if _, ok := spec.Providers[id]; !ok {
-			spec.Providers[id] = harnessSupervisorConfig(cfg, name, version, runtimeState, false)
+			spec.Providers[id] = harnessProviderConfig(cfg, providerSettingsFor(cfg, ref, role == harness.RoleChat), version, runtimeState)
 		}
 	}
 	return spec
