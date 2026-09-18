@@ -25,6 +25,13 @@ import (
 	"github.com/agent0ai/spynel/internal/shortid"
 )
 
+const LeaseBlockedProviderUnavailable = "provider_unavailable"
+
+type LeaseBlock struct {
+	Reason string    `json:"reason"`
+	Since  time.Time `json:"since"`
+}
+
 type Lease struct {
 	ID                     string          `json:"id"`
 	ClaimID                string          `json:"claim_id,omitempty"`
@@ -40,6 +47,7 @@ type Lease struct {
 	HeartbeatAt            time.Time       `json:"heartbeat_at"`
 	RecoveryCount          int             `json:"recovery_count"`
 	LastError              string          `json:"last_error,omitempty"`
+	Blocked                *LeaseBlock     `json:"blocked,omitempty"`
 	Phase                  string          `json:"phase,omitempty"`
 	ClaimAttempt           int             `json:"claim_attempt,omitempty"`
 	ImplementerThread      string          `json:"implementer_thread,omitempty"`
@@ -732,6 +740,7 @@ func (m *Manager) ensureRouteDirectories() error {
 func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease, recovery bool) {
 	_, release, err := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
 	if err != nil {
+		m.markBlocked(ctx, lease, err)
 		return
 	}
 
@@ -765,6 +774,7 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			lease.State = "recovering"
 			lease.LastError = ""
 			lease.HeartbeatAt = time.Now().UTC()
+			clearBlocked(&lease)
 			if err := m.saveLease(lease); err != nil {
 				m.recordError(lease, err)
 				return
@@ -1190,6 +1200,7 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		}
 		_, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
 		if reserveErr != nil {
+			m.markBlocked(ctx, lease, reserveErr)
 			continue
 		}
 		release = held
@@ -1234,6 +1245,7 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 			lease.OwnerID = m.ownerID
 			lease.SourceFile = ""
 			lease.HeartbeatAt = time.Now().UTC()
+			clearBlocked(&lease)
 			if err := m.saveLease(lease); err != nil {
 				return err
 			}
@@ -1243,6 +1255,7 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		// Neither side of the interrupted claim remains. Let ordinary
 		// transition reconciliation locate a moved status file.
 		lease.State = "processing"
+		clearBlocked(&lease)
 		if err := m.saveLease(lease); err != nil {
 			return err
 		}
@@ -1574,16 +1587,18 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 			continue
 		}
 		foreignOwner := lease.OwnerID != "" && lease.OwnerID != m.ownerID
-		if (!foreignOwner && now.Sub(lease.HeartbeatAt) < route.StaleAfter) || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
+		if (lease.Blocked == nil && !foreignOwner && now.Sub(lease.HeartbeatAt) < route.StaleAfter) || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
 		_, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(lease.Phase), lease.SessionKey)
 		if reserveErr != nil {
+			m.markBlocked(ctx, lease, reserveErr)
 			continue
 		}
 		release = held
 		lease.OwnerID = m.ownerID
 		lease.HeartbeatAt = time.Now().UTC()
+		clearBlocked(&lease)
 		if err := m.saveLease(lease); err != nil {
 			return err
 		}
@@ -1830,6 +1845,31 @@ func (m *Manager) saveLease(lease Lease) error {
 		return err
 	}
 	return fsx.AtomicWriteFile(m.leasePath(lease.ID), append(data, '\n'), 0o600)
+}
+
+func (m *Manager) markBlocked(ctx context.Context, lease Lease, err error) {
+	if ctx.Err() != nil || !errors.Is(err, harness.ErrProviderUnavailable) || errors.Is(err, harness.ErrProviderFenced) {
+		return
+	}
+	current, loadErr := m.loadLease(lease.ID)
+	if loadErr != nil || ctx.Err() != nil || current.Blocked != nil {
+		return
+	}
+	current.Blocked = &LeaseBlock{
+		Reason: LeaseBlockedProviderUnavailable,
+		Since:  m.semanticHeartbeatNow(),
+	}
+	if saveErr := m.saveLease(current); saveErr != nil {
+		m.log("save blocked lease: " + saveErr.Error())
+	}
+}
+
+func clearBlocked(lease *Lease) bool {
+	if lease.Blocked == nil {
+		return false
+	}
+	lease.Blocked = nil
+	return true
 }
 
 func (m *Manager) loadLease(id string) (Lease, error) {

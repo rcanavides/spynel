@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
@@ -126,7 +127,11 @@ func TestUnavailableAndFencedProvidersDoNotClaimWorkflow(t *testing.T) {
 					t.Fatal("unavailable role dispatched or fell back")
 				}
 				// Existing recovery also waits without changing durable counters or state.
-				lease := Lease{ID: "existing", Route: "tasks", OwnerID: "prior", SessionKey: "recover", Phase: phase, RecoveryCount: 3, State: "processing", File: tasks[0]}
+				heartbeat := time.Date(2026, time.September, 18, 10, 30, 0, 0, time.UTC)
+				lease := Lease{
+					ID: "existing", Route: "tasks", OwnerID: "prior", SessionKey: "recover", Phase: phase,
+					RecoveryCount: 3, State: "processing", File: tasks[0], HeartbeatAt: heartbeat, LastError: "preserved diagnostic",
+				}
 				if e = manager.saveLease(lease); e != nil {
 					t.Fatal(e)
 				}
@@ -136,8 +141,18 @@ func TestUnavailableAndFencedProvidersDoNotClaimWorkflow(t *testing.T) {
 					t.Fatal(e)
 				}
 				after, e := manager.loadLease(lease.ID)
-				if e != nil || after.RecoveryCount != 3 || after.State != "processing" || after.LastError != "" || after.OwnerID != "prior" || !after.HeartbeatAt.IsZero() {
+				if e != nil || after.RecoveryCount != lease.RecoveryCount || after.State != lease.State || after.LastError != lease.LastError || after.OwnerID != lease.OwnerID || !after.HeartbeatAt.Equal(lease.HeartbeatAt) {
 					t.Fatalf("structural absence became recovery failure: %+v %v", after, e)
+				}
+				if fenced {
+					if after.Blocked != nil {
+						t.Fatalf("fenced provider durably blocked lease: %+v", after.Blocked)
+					}
+				} else if after.Blocked == nil || after.Blocked.Reason != LeaseBlockedProviderUnavailable || after.Blocked.Since.IsZero() {
+					t.Fatalf("unavailable provider did not durably block lease: %+v", after.Blocked)
+				}
+				if provider.calls != 0 || chat.calls != 0 {
+					t.Fatal("existing lease dispatched or fell back")
 				}
 			})
 		}
