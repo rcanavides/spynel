@@ -22,6 +22,10 @@ import (
 const (
 	acpProtocolVersion = 1
 	acpMaxRecord       = 16 * 1024 * 1024
+	// ACP v1 has no per-turn output-close marker after a prompt response.
+	// Drain until updates are quiet, with a fixed cap from the terminal result.
+	acpLateOutputQuiet = 100 * time.Millisecond
+	acpLateOutputMax   = 2 * time.Second
 )
 
 // ACP adapts the stable v1 Agent Client Protocol over its standard JSON-RPC
@@ -30,21 +34,22 @@ const (
 type ACP struct {
 	config HarnessConfig
 
-	keyMu    sync.Mutex
-	keyLocks map[string]*sync.Mutex
-	writeMu  sync.Mutex
-	mu       sync.Mutex
-	ctx      context.Context
-	cancel   context.CancelFunc
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	nextID   uint64
-	pending  map[string]chan acpResponse
-	sessions map[string]acpSession
-	live     map[string]bool
-	active   map[string]*acpTurn
-	caps     acpAgentCapabilities
-	closed   bool
+	keyMu       sync.Mutex
+	keyLocks    map[string]*sync.Mutex
+	writeMu     sync.Mutex
+	mu          sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	nextID      uint64
+	pending     map[string]chan acpResponse
+	promptTurns map[string]*acpTurn
+	sessions    map[string]acpSession
+	live        map[string]bool
+	active      map[string]*acpTurn
+	caps        acpAgentCapabilities
+	closed      bool
 }
 
 type acpSession struct {
@@ -55,10 +60,14 @@ type acpSession struct {
 type acpTurn struct {
 	emit core.Emit
 
-	mu        sync.Mutex
-	text      strings.Builder
-	cancelled bool
-	completed bool
+	mu         sync.Mutex
+	text       strings.Builder
+	cancelled  bool
+	completed  bool
+	terminal   bool
+	stopReason string
+	terminalAt time.Time
+	activity   chan struct{}
 }
 
 type acpResponse struct {
@@ -124,7 +133,8 @@ func NewACP(cfg HarnessConfig) (*ACP, error) {
 	cfg.Cwd = root
 	adapter := &ACP{
 		config: cfg, keyLocks: map[string]*sync.Mutex{}, pending: map[string]chan acpResponse{},
-		sessions: map[string]acpSession{}, live: map[string]bool{}, active: map[string]*acpTurn{},
+		promptTurns: map[string]*acpTurn{},
+		sessions:    map[string]acpSession{}, live: map[string]bool{}, active: map[string]*acpTurn{},
 	}
 	if err := adapter.loadSessions(); err != nil {
 		return nil, err
@@ -256,7 +266,7 @@ func (a *ACP) SendWithInference(ctx context.Context, key, prompt string, selecti
 	if err != nil {
 		return "", false, err
 	}
-	turn := &acpTurn{emit: emit}
+	turn := &acpTurn{emit: emit, activity: make(chan struct{}, 1)}
 	a.mu.Lock()
 	if a.closed || a.ctx == nil {
 		a.mu.Unlock()
@@ -271,7 +281,7 @@ func (a *ACP) SendWithInference(ctx context.Context, key, prompt string, selecti
 	_, waiter, err := a.beginCall("session/prompt", map[string]any{
 		"sessionId": session.ID,
 		"prompt":    []map[string]string{{"type": "text", "text": prompt}},
-	})
+	}, turn)
 	if err != nil {
 		a.mu.Lock()
 		if a.active[key] == turn {
@@ -299,6 +309,14 @@ func (a *ACP) awaitPrompt(key, sessionID string, turn *acpTurn, waiter <-chan ac
 		response.err = ctx.Err()
 	}
 	if response.err != nil {
+		turn.mu.Lock()
+		terminal, stopReason := turn.terminal, turn.stopReason
+		turn.mu.Unlock()
+		if terminal {
+			a.drainTurn(ctx, turn)
+			a.finishPrompt(key, sessionID, turn, stopReason, nil)
+			return
+		}
 		a.finishPrompt(key, sessionID, turn, "", response.err)
 		return
 	}
@@ -313,13 +331,46 @@ func (a *ACP) awaitPrompt(key, sessionID string, turn *acpTurn, waiter <-chan ac
 		a.finishPrompt(key, sessionID, turn, result.StopReason, errors.New("ACP turn cancelled"))
 		return
 	}
-	if result.StopReason == "end_turn" {
-		// Some ACP providers can acknowledge the prompt before the final
-		// agent_message_chunk reaches the client. Keep the turn addressable
-		// for a short bounded grace period so that final text is not lost.
-		time.Sleep(100 * time.Millisecond)
+	turn.mu.Lock()
+	if !turn.terminal {
+		turn.terminal = true
+		turn.stopReason = result.StopReason
+		turn.terminalAt = time.Now()
 	}
+	turn.mu.Unlock()
+	a.drainTurn(ctx, turn)
 	a.finishPrompt(key, sessionID, turn, result.StopReason, nil)
+}
+
+func (a *ACP) drainTurn(ctx context.Context, turn *acpTurn) {
+	turn.mu.Lock()
+	remaining := acpLateOutputMax - time.Since(turn.terminalAt)
+	turn.mu.Unlock()
+	if remaining <= 0 {
+		return
+	}
+	quietTimer := time.NewTimer(acpLateOutputQuiet)
+	maxTimer := time.NewTimer(remaining)
+	defer quietTimer.Stop()
+	defer maxTimer.Stop()
+	for {
+		select {
+		case <-turn.activity:
+			if !quietTimer.Stop() {
+				select {
+				case <-quietTimer.C:
+				default:
+				}
+			}
+			quietTimer.Reset(acpLateOutputQuiet)
+		case <-quietTimer.C:
+			return
+		case <-maxTimer.C:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (a *ACP) finishPrompt(key, sessionID string, turn *acpTurn, stopReason string, turnErr error) {
@@ -530,7 +581,7 @@ func (a *ACP) applySessionOptions(ctx context.Context, sessionID string, options
 }
 
 func (a *ACP) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	key, waiter, err := a.beginCall(method, params)
+	key, waiter, err := a.beginCall(method, params, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -547,7 +598,7 @@ func (a *ACP) call(ctx context.Context, method string, params any) (json.RawMess
 	}
 }
 
-func (a *ACP) beginCall(method string, params any) (string, <-chan acpResponse, error) {
+func (a *ACP) beginCall(method string, params any, turn *acpTurn) (string, <-chan acpResponse, error) {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 	a.mu.Lock()
@@ -560,12 +611,16 @@ func (a *ACP) beginCall(method string, params any) (string, <-chan acpResponse, 
 	key := strconv.FormatUint(id, 10)
 	waiter := make(chan acpResponse, 1)
 	a.pending[key] = waiter
+	if turn != nil {
+		a.promptTurns[key] = turn
+	}
 	stdin := a.stdin
 	a.mu.Unlock()
 	err := writeACP(stdin, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
 	if err != nil {
 		a.mu.Lock()
 		delete(a.pending, key)
+		delete(a.promptTurns, key)
 		a.mu.Unlock()
 		return "", nil, err
 	}
@@ -615,13 +670,31 @@ func (a *ACP) readLoop(reader io.Reader) {
 		a.mu.Lock()
 		waiter := a.pending[key]
 		delete(a.pending, key)
-		a.mu.Unlock()
+		turn := a.promptTurns[key]
+		delete(a.promptTurns, key)
 		if waiter != nil {
 			response := acpResponse{result: envelope.Result}
 			if envelope.Error != nil {
 				response.err = envelope.Error
 			}
+			if turn != nil && response.err == nil {
+				var result struct {
+					StopReason string `json:"stopReason"`
+				}
+				if json.Unmarshal(response.result, &result) == nil && result.StopReason != "cancelled" {
+					turn.mu.Lock()
+					if !turn.completed {
+						turn.terminal = true
+						turn.stopReason = result.StopReason
+						turn.terminalAt = time.Now()
+					}
+					turn.mu.Unlock()
+				}
+			}
+			a.mu.Unlock()
 			waiter <- response
+		} else {
+			a.mu.Unlock()
 		}
 	}
 	err := scanner.Err()
@@ -667,6 +740,12 @@ func (a *ACP) handleSessionUpdate(raw json.RawMessage) {
 	if turn == nil {
 		return
 	}
+	turn.mu.Lock()
+	completed := turn.completed
+	turn.mu.Unlock()
+	if completed {
+		return
+	}
 	switch params.Update.SessionUpdate {
 	case "agent_message_chunk":
 		var content struct {
@@ -675,6 +754,10 @@ func (a *ACP) handleSessionUpdate(raw json.RawMessage) {
 		}
 		if json.Unmarshal(params.Update.Content, &content) == nil && content.Type == "text" && content.Text != "" {
 			turn.mu.Lock()
+			if turn.completed {
+				turn.mu.Unlock()
+				return
+			}
 			turn.text.WriteString(content.Text)
 			emit := turn.emit
 			turn.mu.Unlock()
@@ -696,6 +779,10 @@ func (a *ACP) handleSessionUpdate(raw json.RawMessage) {
 			executionDetail += " (" + toolStatus + ")"
 		}
 		turn.mu.Lock()
+		if turn.completed {
+			turn.mu.Unlock()
+			return
+		}
 		emit := turn.emit
 		turn.mu.Unlock()
 		if emit != nil {
@@ -703,6 +790,14 @@ func (a *ACP) handleSessionUpdate(raw json.RawMessage) {
 				Execution: &core.ExecutionStatus{State: "running", Detail: executionDetail}})
 		}
 	}
+	turn.mu.Lock()
+	if !turn.completed {
+		select {
+		case turn.activity <- struct{}{}:
+		default:
+		}
+	}
+	turn.mu.Unlock()
 }
 
 func (a *ACP) turnForSession(sessionID string) (string, *acpTurn) {
@@ -820,8 +915,21 @@ func (a *ACP) fail(err error) {
 	a.closed = true
 	pending := a.pending
 	a.pending = map[string]chan acpResponse{}
-	active := a.active
-	a.active = map[string]*acpTurn{}
+	a.promptTurns = map[string]*acpTurn{}
+	type failedTurn struct {
+		key  string
+		emit core.Emit
+	}
+	var failed []failedTurn
+	for key, turn := range a.active {
+		turn.mu.Lock()
+		if !turn.completed && !turn.terminal {
+			turn.completed = true
+			failed = append(failed, failedTurn{key: key, emit: turn.emit})
+			delete(a.active, key)
+		}
+		turn.mu.Unlock()
+	}
 	a.stdin = nil
 	cancel := a.cancel
 	a.mu.Unlock()
@@ -831,20 +939,12 @@ func (a *ACP) fail(err error) {
 	for _, waiter := range pending {
 		waiter <- acpResponse{err: err}
 	}
-	for key, turn := range active {
+	for _, failedTurn := range failed {
 		a.mu.Lock()
-		sessionID := a.sessions[key].ID
+		sessionID := a.sessions[failedTurn.key].ID
 		a.mu.Unlock()
-		turn.mu.Lock()
-		if turn.completed {
-			turn.mu.Unlock()
-			continue
-		}
-		turn.completed = true
-		emit := turn.emit
-		turn.mu.Unlock()
-		if emit != nil {
-			emit(core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: sessionID, Done: true,
+		if failedTurn.emit != nil {
+			failedTurn.emit(core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: sessionID, Done: true,
 				Execution: &core.ExecutionStatus{State: "error", Detail: err.Error()}})
 		}
 	}
