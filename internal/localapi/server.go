@@ -411,11 +411,9 @@ func (s *Server) settings(response http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) runOnce(response http.ResponseWriter, request *http.Request) {
-	if err := s.Service.Orchestrator.ScanOnce(request.Context()); err != nil {
-		writeError(response, err)
-		return
-	}
-	if err := s.Service.Orchestrator.WaitForIdle(request.Context()); err != nil {
+	scanErr := s.Service.Orchestrator.ScanOnce(request.Context())
+	waitErr := s.Service.Orchestrator.WaitForIdle(request.Context())
+	if err := errors.Join(scanErr, waitErr); err != nil {
 		writeError(response, err)
 		return
 	}

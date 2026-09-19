@@ -884,10 +884,13 @@ func runOnce(configPath, version string) error {
 		service.Runtime.LogEvent("error", "startup", "service_start_failed", "Service startup failed")
 		return err
 	}
-	if err := service.Orchestrator.ScanOnce(ctx); err != nil {
-		return err
-	}
-	return service.Orchestrator.WaitForIdle(ctx)
+	return scanAndWaitForIdle(ctx, service.Orchestrator)
+}
+
+func scanAndWaitForIdle(ctx context.Context, manager *orchestrator.Manager) error {
+	scanErr := manager.ScanOnce(ctx)
+	waitErr := manager.WaitForIdle(ctx)
+	return errors.Join(scanErr, waitErr)
 }
 
 func runMessageMode(configPath, conversation, text, version string, options messageRunOptions) error {

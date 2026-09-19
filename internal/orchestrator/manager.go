@@ -480,22 +480,35 @@ func (m *Manager) scanOnce(ctx context.Context) error {
 	if err := m.ensureRouteDirectories(); err != nil {
 		return err
 	}
-	if err := m.resumeInterruptedClaims(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := m.reconcileTransitions(ctx); err != nil {
+	var errs []error
+	collect := func(err error) error {
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(append(errs, ctxErr)...)
+		}
+		return nil
+	}
+	if err := collect(m.resumeInterruptedClaims(ctx)); err != nil {
 		return err
 	}
-	if err := m.recoverStale(ctx); err != nil {
+	if err := collect(m.reconcileTransitions(ctx)); err != nil {
 		return err
 	}
-	if err := m.recoverOrphanClaims(ctx); err != nil {
+	if err := collect(m.recoverStale(ctx)); err != nil {
 		return err
 	}
-	if err := m.wakeWaitingDocuments(ctx); err != nil {
+	if err := collect(m.recoverOrphanClaims(ctx)); err != nil {
 		return err
 	}
-	if err := m.advanceActiveGoals(); err != nil {
+	if err := collect(m.wakeWaitingDocuments(ctx)); err != nil {
+		return err
+	}
+	if err := collect(m.advanceActiveGoals()); err != nil {
 		return err
 	}
 	for _, route := range workflowRoutes() {
@@ -507,7 +520,10 @@ func (m *Manager) scanOnce(ctx context.Context) error {
 			err = m.scanPhaseQueue(ctx, route, cfg.Resolve(route.Source), cfg.Resolve(route.Working), phaseGoalPlanning)
 		}
 		if err != nil {
-			return fmt.Errorf("route %s: %w", route.Name, err)
+			err = fmt.Errorf("route %s: %w", route.Name, err)
+		}
+		if stop := collect(err); stop != nil {
+			return stop
 		}
 	}
 	for _, route := range workflowRoutes() {
@@ -521,14 +537,21 @@ func (m *Manager) scanOnce(ctx context.Context) error {
 		default:
 			continue
 		}
-		if err := m.scanPhaseQueue(ctx, route, filepath.Join(base, "review"), filepath.Join(base, "reviewing"), phase); err != nil {
-			return err
+		err := m.scanPhaseQueue(ctx, route, filepath.Join(base, "review"), filepath.Join(base, "reviewing"), phase)
+		if err != nil {
+			err = fmt.Errorf("route %s review: %w", route.Name, err)
+		}
+		if stop := collect(err); stop != nil {
+			return stop
 		}
 	}
 	if err := m.Outbox.Process(ctx); err != nil {
 		m.log("notification delivery deferred: " + err.Error())
 	}
-	return nil
+	if err := ctx.Err(); err != nil {
+		return errors.Join(append(errs, err)...)
+	}
+	return errors.Join(errs...)
 }
 
 func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourceDir, claimedDir, phase string) error {
@@ -962,14 +985,21 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, lease := range leases {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
 		if lease.State == "claiming" {
 			continue
 		}
 		if _, statErr := os.Stat(lease.File); statErr == nil {
 			continue
 		} else if !os.IsNotExist(statErr) {
-			return statErr
+			err := fmt.Errorf("lease %s: stat %s: %w", lease.ID, lease.File, statErr)
+			m.log("reconcile " + err.Error())
+			errs = append(errs, err)
+			continue
 		}
 		route, ok := routeByName(lease.Route)
 		if !ok {
@@ -978,19 +1008,39 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 		base := filepath.Dir(m.Config.Resolve(route.Source))
 		name := filepath.Base(lease.File)
 		status, path := "", ""
+		candidateUnreadable := false
 		for _, candidate := range route.AllowedNext {
 			test := filepath.Join(base, candidate, name)
-			if _, e := os.Stat(test); e == nil {
-				status, path = candidate, test
-				break
+			if _, statErr := os.Stat(test); statErr != nil {
+				if !os.IsNotExist(statErr) {
+					err := fmt.Errorf("lease %s (%s): stat transition candidate %s: %w", lease.ID, route.Name, test, statErr)
+					m.log("reconcile " + err.Error())
+					errs = append(errs, err)
+					candidateUnreadable = true
+				}
+				continue
 			}
+			if _, readErr := ReadDocument(test); readErr != nil {
+				err := fmt.Errorf("lease %s (%s): unreadable transition candidate %s: %w", lease.ID, route.Name, test, readErr)
+				m.log("reconcile skipped " + err.Error())
+				errs = append(errs, err)
+				candidateUnreadable = true
+				continue
+			}
+			status, path = candidate, test
+			break
 		}
 		if status == "" {
+			if candidateUnreadable {
+				errs = append(errs, fmt.Errorf("lease %s: no readable transition candidate for %s", lease.ID, name))
+				continue
+			}
 			_ = os.Remove(m.leasePath(lease.ID))
 			m.finishRuntimeJob(lease.ID)
 			continue
 		}
 		phase := normalizeLeasePhase(route.Name, lease.Phase)
+		candidateStatus, candidatePath := status, path
 		switch route.Name {
 		case "tasks":
 			status, path, err = m.reconcileTaskTransition(ctx, route, lease, phase, status, path)
@@ -998,17 +1048,19 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 			status, path, err = m.reconcileGoalTransition(ctx, route, lease, phase, status, path)
 		}
 		if err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("lease %s: reconcile %s candidate %s: %w", lease.ID, candidateStatus, candidatePath, err))
+			continue
 		}
 		_ = os.Remove(m.leasePath(lease.ID))
 		m.finishRuntimeJob(lease.ID)
 		if route.Name == "goals" && phase == phaseGoalReview && status == "planning" {
 			if err := m.startExistingClaim(ctx, route, path, phaseGoalPlanning, false, true); err != nil {
-				return err
+				errs = append(errs, fmt.Errorf("lease %s: continue goal planning at %s: %w", lease.ID, path, err))
+				continue
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func normalizeLeasePhase(routeName, phase string) string {
@@ -1234,6 +1286,11 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var errs []error
+	record := func(err error) {
+		m.log("resume interrupted claim: " + err.Error())
+		errs = append(errs, err)
+	}
 	// One reservation is held at a time across iterations: each is released
 	// when the next iteration starts, and the last one by this deferred release.
 	var release func()
@@ -1246,6 +1303,9 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		if release != nil {
 			release()
 			release = nil
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
 		}
 		if lease.State != "claiming" || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
@@ -1260,20 +1320,36 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		if providerID != "" {
 			lease.Provider = providerID
 		}
-		if _, err := os.Stat(lease.File); os.IsNotExist(err) && lease.SourceFile != "" {
-			if _, sourceErr := os.Stat(lease.SourceFile); sourceErr == nil {
+		_, fileErr := os.Stat(lease.File)
+		if fileErr != nil && !os.IsNotExist(fileErr) {
+			record(fmt.Errorf("lease %s: stat %s: %w", lease.ID, lease.File, fileErr))
+			continue
+		}
+		if os.IsNotExist(fileErr) && lease.SourceFile != "" {
+			_, sourceErr := os.Stat(lease.SourceFile)
+			if sourceErr != nil && !os.IsNotExist(sourceErr) {
+				record(fmt.Errorf("lease %s: stat source %s: %w", lease.ID, lease.SourceFile, sourceErr))
+				continue
+			}
+			if sourceErr == nil {
 				phase := normalizeLeasePhase(lease.Route, lease.Phase)
 				field := phaseAttemptField(phase)
 				document, claimErr := m.claimPhaseDocument(lease.SourceFile, lease.File, phaseClaimedStatus(phase), field, time.Now())
 				if claimErr != nil {
-					return claimErr
+					record(fmt.Errorf("lease %s: claim %s into %s: %w", lease.ID, lease.SourceFile, lease.File, claimErr))
+					continue
 				}
 				if lease.ClaimAttempt == 0 {
 					lease.ClaimAttempt = numberValue(document.FrontMatter[field])
 				}
 			}
 		}
-		if _, err := os.Stat(lease.File); err == nil {
+		_, fileErr = os.Stat(lease.File)
+		if fileErr != nil && !os.IsNotExist(fileErr) {
+			record(fmt.Errorf("lease %s: stat %s: %w", lease.ID, lease.File, fileErr))
+			continue
+		}
+		if fileErr == nil {
 			route, ok := routeByName(lease.Route)
 			if !ok {
 				continue
@@ -1282,11 +1358,13 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 			field := phaseAttemptField(phase)
 			document, readErr := ReadDocument(lease.File)
 			if readErr != nil {
-				return readErr
+				record(fmt.Errorf("lease %s: read %s: %w", lease.ID, lease.File, readErr))
+				continue
 			}
 			attempt := lease.ClaimAttempt
 			if attempt < 1 {
-				return fmt.Errorf("claim lease %s has no phase attempt", lease.ID)
+				record(fmt.Errorf("claim lease %s at %s has no phase attempt", lease.ID, lease.File))
+				continue
 			}
 			document.FrontMatter["status"] = phaseClaimedStatus(phase)
 			document.FrontMatter["updated_at"] = lease.StartedAt.UTC().Format(time.RFC3339)
@@ -1295,7 +1373,8 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 			}
 			document.FrontMatter[field] = attempt
 			if err := WriteDocument(lease.File, document); err != nil {
-				return err
+				record(fmt.Errorf("lease %s: write %s: %w", lease.ID, lease.File, err))
+				continue
 			}
 			lease.State = "recovering"
 			lease.OwnerID = m.ownerID
@@ -1303,7 +1382,8 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 			lease.HeartbeatAt = time.Now().UTC()
 			clearBlocked(&lease)
 			if err := m.saveLease(lease); err != nil {
-				return err
+				record(fmt.Errorf("lease %s: save resumed claim: %w", lease.ID, err))
+				continue
 			}
 			if moved {
 				m.log(fmt.Sprintf("durable provider owner moved %s -> %s", oldProvider, lease.Provider))
@@ -1320,13 +1400,14 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		}
 		clearBlocked(&lease)
 		if err := m.saveLease(lease); err != nil {
-			return err
+			record(fmt.Errorf("lease %s: save interrupted claim: %w", lease.ID, err))
+			continue
 		}
 		if moved {
 			m.log(fmt.Sprintf("durable provider owner moved %s -> %s", oldProvider, lease.Provider))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (m *Manager) claimPhaseDocument(source, target, status, attemptField string, now time.Time) (Document, error) {
@@ -1338,6 +1419,7 @@ func (m *Manager) claimPhaseDocument(source, target, status, attemptField string
 
 func (m *Manager) recoverOrphanClaims(ctx context.Context) error {
 	cfg := m.runtimeSnapshot()
+	var errs []error
 	for _, route := range workflowRoutes() {
 		base := filepath.Dir(cfg.Resolve(route.Source))
 		var phases map[string]string
@@ -1350,15 +1432,24 @@ func (m *Manager) recoverOrphanClaims(ctx context.Context) error {
 			continue
 		}
 		for status, phase := range phases {
+			if err := ctx.Err(); err != nil {
+				return errors.Join(append(errs, err)...)
+			}
 			directory := filepath.Join(base, status)
 			entries, err := os.ReadDir(directory)
 			if os.IsNotExist(err) {
 				continue
 			}
 			if err != nil {
-				return err
+				wrapped := fmt.Errorf("read claimed %s directory %s: %w", route.Name, directory, err)
+				m.log("recover orphan claims: " + wrapped.Error())
+				errs = append(errs, wrapped)
+				continue
 			}
 			for _, entry := range entries {
+				if err := ctx.Err(); err != nil {
+					return errors.Join(append(errs, err)...)
+				}
 				if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") || entry.Name() == "AGENTS.md" {
 					continue
 				}
@@ -1368,12 +1459,15 @@ func (m *Manager) recoverOrphanClaims(ctx context.Context) error {
 				}
 				m.log("recovering claimed document without lease: " + path)
 				if err := m.startExistingClaim(ctx, route, path, phase, true, false); err != nil {
-					return err
+					wrapped := fmt.Errorf("recover orphan claim %s: %w", path, err)
+					m.log(wrapped.Error())
+					errs = append(errs, wrapped)
+					continue
 				}
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (m *Manager) hasLeaseForFile(path string) bool {
