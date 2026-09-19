@@ -734,16 +734,38 @@ func numberValue(value any) int {
 	return 0
 }
 
-func (m *Manager) reserveLease(lease Lease) (harness.ProviderID, func(), error) {
+// reserveLease changes an absent durable owner only after exact owned admission
+// proves absence. The caller saves the changed lease before dispatch.
+func (m *Manager) reserveLease(lease *Lease) (harness.ProviderID, func(), bool, error) {
 	target := m.harnessForPhase(lease.Phase)
 	if lease.Provider == "" {
-		return harness.ReserveExecution(target, lease.SessionKey)
+		providerID, release, err := harness.ReserveExecution(target, lease.SessionKey)
+		return providerID, release, false, err
 	}
 	release, err := harness.ReserveOwnedExecution(target, lease.SessionKey, lease.Provider)
-	if err != nil {
-		return "", nil, err
+	if err == nil {
+		return lease.Provider, release, false, nil
 	}
-	return lease.Provider, release, nil
+	if !errors.Is(err, harness.ErrProviderAbsent) {
+		return "", nil, false, err
+	}
+	providerID, replacementRelease, replacementErr := harness.ReserveExecution(target, lease.SessionKey)
+	if replacementErr != nil {
+		if replacementRelease != nil {
+			replacementRelease()
+		}
+		return "", nil, false, errors.Join(harness.ErrProviderAbsent, replacementErr)
+	}
+	if providerID == "" {
+		if replacementRelease != nil {
+			replacementRelease()
+		}
+		return "", nil, false, fmt.Errorf("%w: replacement reservation has no provider instance ID", harness.ErrProviderAbsent)
+	}
+	lease.Provider = providerID
+	lease.ThreadID = ""
+	clearBlocked(lease)
+	return providerID, replacementRelease, true, nil
 }
 
 func (m *Manager) ensureRouteDirectories() error {
@@ -757,10 +779,21 @@ func (m *Manager) ensureRouteDirectories() error {
 }
 
 func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease, recovery bool) {
-	_, release, err := m.reserveLease(lease)
+	oldProvider := lease.Provider
+	_, release, moved, err := m.reserveLease(&lease)
 	if err != nil {
 		m.markBlocked(ctx, lease, err)
 		return
+	}
+	if moved {
+		lease.OwnerID = m.ownerID
+		lease.HeartbeatAt = time.Now().UTC()
+		if err := m.saveLease(lease); err != nil {
+			release()
+			m.log("save moved lease before dispatch: " + err.Error())
+			return
+		}
+		m.log(fmt.Sprintf("durable provider owner moved %s -> %s", oldProvider, lease.Provider))
 	}
 
 	m.setInflight(lease.ID, true)
@@ -1217,7 +1250,8 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		if lease.State != "claiming" || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
-		providerID, held, reserveErr := m.reserveLease(lease)
+		oldProvider := lease.Provider
+		providerID, held, moved, reserveErr := m.reserveLease(&lease)
 		if reserveErr != nil {
 			m.markBlocked(ctx, lease, reserveErr)
 			continue
@@ -1271,15 +1305,25 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 			if err := m.saveLease(lease); err != nil {
 				return err
 			}
+			if moved {
+				m.log(fmt.Sprintf("durable provider owner moved %s -> %s", oldProvider, lease.Provider))
+			}
 			m.dispatch(ctx, route, lease, true)
 			continue
 		}
 		// Neither side of the interrupted claim remains. Let ordinary
 		// transition reconciliation locate a moved status file.
 		lease.State = "processing"
+		if moved {
+			lease.OwnerID = m.ownerID
+			lease.HeartbeatAt = time.Now().UTC()
+		}
 		clearBlocked(&lease)
 		if err := m.saveLease(lease); err != nil {
 			return err
+		}
+		if moved {
+			m.log(fmt.Sprintf("durable provider owner moved %s -> %s", oldProvider, lease.Provider))
 		}
 	}
 	return nil
@@ -1612,7 +1656,8 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 		if (lease.Blocked == nil && !foreignOwner && now.Sub(lease.HeartbeatAt) < route.StaleAfter) || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
-		providerID, held, reserveErr := m.reserveLease(lease)
+		oldProvider := lease.Provider
+		providerID, held, moved, reserveErr := m.reserveLease(&lease)
 		if reserveErr != nil {
 			m.markBlocked(ctx, lease, reserveErr)
 			continue
@@ -1626,6 +1671,9 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 		clearBlocked(&lease)
 		if err := m.saveLease(lease); err != nil {
 			return err
+		}
+		if moved {
+			m.log(fmt.Sprintf("durable provider owner moved %s -> %s", oldProvider, lease.Provider))
 		}
 		m.dispatch(ctx, route, lease, true)
 	}
@@ -1873,7 +1921,7 @@ func (m *Manager) saveLease(lease Lease) error {
 }
 
 func (m *Manager) markBlocked(ctx context.Context, lease Lease, err error) {
-	if ctx.Err() != nil || !errors.Is(err, harness.ErrProviderUnavailable) || errors.Is(err, harness.ErrProviderFenced) {
+	if ctx.Err() != nil || !errors.Is(err, harness.ErrProviderUnavailable) || errors.Is(err, harness.ErrProviderFenced) || errors.Is(err, harness.ErrProviderAbsent) {
 		return
 	}
 	current, loadErr := m.loadLease(lease.ID)

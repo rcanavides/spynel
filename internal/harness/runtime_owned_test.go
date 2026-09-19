@@ -152,6 +152,20 @@ func TestOwnedReservationRuntimeClosed(t *testing.T) {
 	}
 }
 
+func TestOwnedReservationRuntimeClosedWithAbsentOwner(t *testing.T) {
+	f, _, _ := ownedRuntimeFixture(t)
+	if err := f.r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	release, err := ReserveOwnedExecution(f.r.AcquireRole(RoleDeveloper), "closed-absent", "deleted-owner")
+	if release != nil || !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("reservation release=%v err=%v", release != nil, err)
+	}
+	if errors.Is(err, ErrProviderAbsent) {
+		t.Fatalf("closed runtime reported owner absence: %v", err)
+	}
+}
+
 func TestOwnedReservationReusesSameOwnerBinding(t *testing.T) {
 	f, _, _ := ownedRuntimeFixture(t)
 	target := f.r.AcquireRole(RoleDeveloper)
