@@ -1239,7 +1239,7 @@ func harnessSupervisorConfig(
 	return harnessProviderConfig(cfg, legacyProviderSettings(cfg, name, primary), version, runtimeState)
 }
 
-func harnessRuntimeSpec(cfg config.Config, version string, runtimeState *app.Runtime) harness.RuntimeSpec {
+func harnessRuntimeSpec(cfg config.Config, version string, runtimeState *app.Runtime, retainedOwners ...harness.ProviderID) harness.RuntimeSpec {
 	spec := harness.RuntimeSpec{Providers: make(map[harness.ProviderID]harness.HarnessConfig), Roles: make(map[harness.Role]harness.ProviderID)}
 	// Chat resolves first so a role inheriting the primary instance reuses the
 	// primary composition. Only instances actually referenced by chat or one
@@ -1252,12 +1252,42 @@ func harnessRuntimeSpec(cfg config.Config, version string, runtimeState *app.Run
 			spec.Providers[id] = harnessProviderConfig(cfg, providerSettingsFor(cfg, ref, role == harness.RoleChat), version, runtimeState)
 		}
 	}
+	for _, owner := range retainedOwners {
+		if owner == "" {
+			continue
+		}
+		if _, exists := spec.Providers[owner]; exists {
+			continue
+		}
+		name := string(owner)
+		var ref config.ProviderRef
+		if profile, exists := cfg.Harness.Providers[name]; exists {
+			ref = config.ProviderRef{ID: name, Kind: profile.Harness, Profile: &profile}
+		} else {
+			if _, exists := harness.Lookup(name); !exists {
+				continue
+			}
+			ref = config.ProviderRef{ID: name, Kind: name}
+		}
+		provider := harnessProviderConfig(cfg, providerSettingsFor(cfg, ref, false), version, runtimeState)
+		// A retained-only custom-ACP owner whose command did not resolve is
+		// unresolvable: omit it instead of failing provider composition.
+		// Role-referenced providers keep failing configuration normally.
+		if definition, ok := harness.Lookup(provider.Name); ok && definition.Custom && strings.TrimSpace(provider.Command) == "" {
+			continue
+		}
+		spec.Providers[owner] = provider
+	}
 	return spec
 }
 
 func buildService(cfg config.Config, version string) (*app.Service, error) {
 	if err := workspace.Upgrade(cfg.Root); err != nil {
 		return nil, fmt.Errorf("upgrade Spynel workspace: %w", err)
+	}
+	retainedOwners, err := orchestrator.DurableProviderOwners(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("load durable provider owners: %w", err)
 	}
 
 	runtimeState := app.NewRuntimeAt(
@@ -1267,14 +1297,18 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 
 	registry := harness.NewBuiltinRegistry()
 
-	providers, err := harness.NewRuntimeSpec(registry, harnessRuntimeSpec(cfg, version, runtimeState))
+	providers, err := harness.NewRuntimeSpec(registry, harnessRuntimeSpec(cfg, version, runtimeState, retainedOwners...))
 	if err != nil {
 		runtimeState.Close()
 		return nil, err
 	}
 	service := app.NewWithHarnessRuntime(cfg, providers, runtimeState)
 	service.ReconfigureProviders = func(next config.Config) error {
-		return providers.Reconcile(context.Background(), harnessRuntimeSpec(next, version, runtimeState))
+		owners, ownerErr := orchestrator.DurableProviderOwners(next)
+		if ownerErr != nil {
+			return fmt.Errorf("load durable provider owners: %w", ownerErr)
+		}
+		return providers.Reconcile(context.Background(), harnessRuntimeSpec(next, version, runtimeState, owners...))
 	}
 
 	service.Updates = updater.Detect(version)

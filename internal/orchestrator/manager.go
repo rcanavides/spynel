@@ -1932,6 +1932,31 @@ func (m *Manager) loadLeases() ([]Lease, error) {
 	return leases, nil
 }
 
+// DurableProviderOwners returns the exact provider instances referenced by
+// active durable lease records. It follows loadLeases record semantics: a
+// missing lease directory yields no owners, a directory-level read failure
+// fails, and an individual malformed or unreadable lease record is skipped
+// read-only without mutation so valid leases still contribute their owners.
+func DurableProviderOwners(cfg config.Config) ([]harness.ProviderID, error) {
+	loader := &Manager{Config: cfg}
+	leases, err := loader.loadLeases()
+	if err != nil {
+		return nil, err
+	}
+	unique := make(map[harness.ProviderID]struct{})
+	for _, lease := range leases {
+		if lease.Provider != "" {
+			unique[lease.Provider] = struct{}{}
+		}
+	}
+	owners := make([]harness.ProviderID, 0, len(unique))
+	for owner := range unique {
+		owners = append(owners, owner)
+	}
+	sort.Slice(owners, func(i, j int) bool { return owners[i] < owners[j] })
+	return owners, nil
+}
+
 // LeaseForSession returns the newest persisted lease for an orchestrator
 // session. The value copy remains safe if the lease is concurrently updated.
 func (m *Manager) LeaseForSession(sessionKey string) (Lease, bool) {

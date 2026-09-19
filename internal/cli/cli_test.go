@@ -27,6 +27,7 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/localapi"
+	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/updater"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
@@ -2159,6 +2160,411 @@ func expectedLegacyHarnessConfig(cfg config.Config, name, version string, primar
 	expected.Command = expectedLegacyHarnessCommand(name, "")
 	expected.Args = harness.CommandArgs(name, nil)
 	return expected
+}
+
+func durableOwnerCLIConfig(t *testing.T) config.Config {
+	t.Helper()
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "agent-zero"
+	cfg.Harness.Providers = map[string]config.ProviderProfile{
+		"codex-dev": {Harness: "codex", Model: "OWNER"},
+		"glm-dev":   {Harness: "codex", Model: "CURRENT"},
+	}
+	cfg.Harness.Routing = &config.HarnessRouting{Developer: "glm-dev"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func writeDurableOwnerLease(t *testing.T, cfg config.Config, id string, owner harness.ProviderID) (string, []byte) {
+	t.Helper()
+	lease := orchestrator.Lease{ID: id, Provider: owner, Route: "tasks", File: "task.md", SessionKey: id, State: "processing"}
+	data, err := json.MarshalIndent(lease, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	directory := cfg.StatePath("runtime", "leases")
+	if err = os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, id+".json")
+	if err = os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path, data
+}
+
+func serviceProviderRuntime(t *testing.T, service *app.Service) *harness.Runtime {
+	t.Helper()
+	runtime, ok := service.Orchestrator.HarnessRouter.(*harness.Runtime)
+	if !ok {
+		t.Fatalf("orchestrator router = %T, want *harness.Runtime", service.Orchestrator.HarnessRouter)
+	}
+	return runtime
+}
+
+func assertOwnedProviderPresentButUnstarted(t *testing.T, runtime *harness.Runtime, owner harness.ProviderID) {
+	t.Helper()
+	release, err := harness.ReserveOwnedExecution(runtime.AcquireRole(harness.RoleDeveloper), "retained:"+string(owner), owner)
+	if release != nil {
+		release()
+	}
+	if errors.Is(err, harness.ErrProviderAbsent) || !errors.Is(err, harness.ErrProviderUnavailable) {
+		t.Fatalf("owned reservation for %q = %v, want present but unavailable", owner, err)
+	}
+}
+
+func TestBuildServiceRetainsDurableProviderOwnerAtStartup(t *testing.T) {
+	cfg := durableOwnerCLIConfig(t)
+	writeDurableOwnerLease(t, cfg, "startup-owner", "codex-dev")
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	owners, err := orchestrator.DurableProviderOwners(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := harnessRuntimeSpec(cfg, "test", service.Runtime, owners...)
+	if _, ok := spec.Providers["codex-dev"]; !ok {
+		t.Fatalf("startup spec omitted durable owner: %#v", spec.Providers)
+	}
+	if _, ok := spec.Providers["glm-dev"]; !ok {
+		t.Fatalf("startup spec omitted current role provider: %#v", spec.Providers)
+	}
+	if spec.Providers["codex-dev"].Name != "codex" || spec.Providers["glm-dev"].Name != "codex" {
+		t.Fatalf("same-kind providers collapsed: %#v", spec.Providers)
+	}
+	if got := spec.Roles[harness.RoleDeveloper]; got != "glm-dev" {
+		t.Fatalf("developer role = %q, want glm-dev", got)
+	}
+	for role, provider := range spec.Roles {
+		if provider == "codex-dev" {
+			t.Fatalf("retained owner gained synthetic role %q", role)
+		}
+	}
+	runtime := serviceProviderRuntime(t, service)
+	if got := harness.ExecutionProvider(runtime.AcquireRole(harness.RoleDeveloper), "role-probe"); got != "glm-dev" {
+		t.Fatalf("published developer role = %q", got)
+	}
+	assertOwnedProviderPresentButUnstarted(t, runtime, "codex-dev")
+}
+
+func TestReconfigureProvidersUsesCurrentDurableOwnersAndReleasesLastOwner(t *testing.T) {
+	cfg := durableOwnerCLIConfig(t)
+	cfg.Harness.Routing.Developer = "codex-dev"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	runtime := serviceProviderRuntime(t, service)
+
+	leasePath, _ := writeDurableOwnerLease(t, cfg, "live-owner", "codex-dev")
+	next := cfg
+	routing := *cfg.Harness.Routing
+	routing.Developer = "glm-dev"
+	next.Harness.Routing = &routing
+	if err = service.ReconfigureProviders(next); err != nil {
+		t.Fatal(err)
+	}
+	if got := harness.ExecutionProvider(runtime.AcquireRole(harness.RoleDeveloper), "remapped-role"); got != "glm-dev" {
+		t.Fatalf("remapped developer role = %q", got)
+	}
+	assertOwnedProviderPresentButUnstarted(t, runtime, "codex-dev")
+
+	if err = os.Remove(leasePath); err != nil {
+		t.Fatal(err)
+	}
+	if err = service.ReconfigureProviders(next); err != nil {
+		t.Fatal(err)
+	}
+	if release, reserveErr := harness.ReserveOwnedExecution(runtime.AcquireRole(harness.RoleDeveloper), "retired-owner", "codex-dev"); release != nil || !errors.Is(reserveErr, harness.ErrProviderAbsent) {
+		if release != nil {
+			release()
+		}
+		t.Fatalf("reservation after final lease removal = %v, want ErrProviderAbsent", reserveErr)
+	}
+}
+
+func TestBuildServiceDoesNotSynthesizeUnresolvableDurableOwner(t *testing.T) {
+	cfg := durableOwnerCLIConfig(t)
+	delete(cfg.Harness.Providers, "codex-dev")
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	leasePath, before := writeDurableOwnerLease(t, cfg, "missing-owner", "codex-dev")
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	runtime := serviceProviderRuntime(t, service)
+	if got := harness.ExecutionProvider(runtime.AcquireRole(harness.RoleDeveloper), "missing-role-probe"); got != "glm-dev" {
+		t.Fatalf("developer role = %q, want glm-dev", got)
+	}
+	if release, reserveErr := harness.ReserveOwnedExecution(runtime.AcquireRole(harness.RoleDeveloper), "missing-owner", "codex-dev"); release != nil || !errors.Is(reserveErr, harness.ErrProviderAbsent) {
+		if release != nil {
+			release()
+		}
+		t.Fatalf("unresolvable owner reservation = %v, want ErrProviderAbsent", reserveErr)
+	}
+	after, err := os.ReadFile(leasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("unresolvable owner composition mutated durable lease")
+	}
+}
+
+func TestBuildServiceSkipsMalformedDurableOwnerLease(t *testing.T) {
+	cfg := durableOwnerCLIConfig(t)
+	writeDurableOwnerLease(t, cfg, "valid-owner", "codex-dev")
+	corrupt := []byte("{not-json\n")
+	corruptPath := filepath.Join(cfg.StatePath("runtime", "leases"), "corrupt.json")
+	if err := os.WriteFile(corruptPath, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	runtime := serviceProviderRuntime(t, service)
+	assertOwnedProviderPresentButUnstarted(t, runtime, "codex-dev")
+	if data, readErr := os.ReadFile(corruptPath); readErr != nil || !bytes.Equal(data, corrupt) {
+		t.Fatalf("malformed lease changed: err = %v", readErr)
+	}
+}
+
+func TestBuildServiceOmitsLegacyACPOwnerWithoutCommand(t *testing.T) {
+	cfg := durableOwnerCLIConfig(t)
+	if _, ok := cfg.Harness.Providers["acp"]; ok {
+		t.Fatal("test scenario requires no named acp provider profile")
+	}
+	if strings.TrimSpace(cfg.Harness.ACPCommand) != "" {
+		t.Fatal("test scenario requires an empty global acp_command")
+	}
+	leasePath, before := writeDurableOwnerLease(t, cfg, "acp-owner", "acp")
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	runtime := serviceProviderRuntime(t, service)
+	owners, err := orchestrator.DurableProviderOwners(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := harnessRuntimeSpec(cfg, "test", service.Runtime, owners...)
+	if _, ok := spec.Providers["acp"]; ok {
+		t.Fatalf("legacy acp owner without command retained: %#v", spec.Providers)
+	}
+	for role, provider := range spec.Roles {
+		if provider == "acp" {
+			t.Fatalf("role %q points to unresolvable acp owner", role)
+		}
+	}
+	if release, reserveErr := harness.ReserveOwnedExecution(runtime.AcquireRole(harness.RoleDeveloper), "acp-owner", "acp"); release != nil || !errors.Is(reserveErr, harness.ErrProviderAbsent) {
+		if release != nil {
+			release()
+		}
+		t.Fatalf("legacy acp owner reservation = %v, want ErrProviderAbsent", reserveErr)
+	}
+	if err = service.ReconfigureProviders(cfg); err != nil {
+		t.Fatalf("reconfigure with legacy acp owner failed: %v", err)
+	}
+	for _, role := range []harness.Role{harness.RoleChat, harness.RoleDeveloper, harness.RoleReviewer, harness.RoleNotification, harness.RoleHeartbeat} {
+		if got := harness.ExecutionProvider(runtime.AcquireRole(role), "acp-role-probe"); got == "acp" {
+			t.Fatalf("published role %q routes to unresolvable acp owner", role)
+		}
+	}
+	if release, reserveErr := harness.ReserveOwnedExecution(runtime.AcquireRole(harness.RoleDeveloper), "acp-owner-reconciled", "acp"); release != nil || !errors.Is(reserveErr, harness.ErrProviderAbsent) {
+		if release != nil {
+			release()
+		}
+		t.Fatalf("legacy acp owner reservation after reconfigure = %v, want ErrProviderAbsent", reserveErr)
+	}
+	after, err := os.ReadFile(leasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("unresolvable acp composition mutated durable lease")
+	}
+}
+
+func TestBuildServiceOmitsRetainedACPOwnerWithUnresolvableCommand(t *testing.T) {
+	cfg := durableOwnerCLIConfig(t)
+	cfg.Harness.Providers["gone-acp"] = config.ProviderProfile{Harness: "acp", ACPCommand: "definitely-not-installed-xyz"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	leasePath, before := writeDurableOwnerLease(t, cfg, "gone-acp-owner", "gone-acp")
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	runtime := serviceProviderRuntime(t, service)
+	owners, err := orchestrator.DurableProviderOwners(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := harnessRuntimeSpec(cfg, "test", service.Runtime, owners...)
+	if _, ok := spec.Providers["gone-acp"]; ok {
+		t.Fatalf("retained acp owner with unresolvable command retained: %#v", spec.Providers)
+	}
+	for role, provider := range spec.Roles {
+		if provider == "gone-acp" {
+			t.Fatalf("role %q points to unresolvable acp owner", role)
+		}
+	}
+	if release, reserveErr := harness.ReserveOwnedExecution(runtime.AcquireRole(harness.RoleDeveloper), "gone-acp-owner", "gone-acp"); release != nil || !errors.Is(reserveErr, harness.ErrProviderAbsent) {
+		if release != nil {
+			release()
+		}
+		t.Fatalf("unresolvable acp owner reservation = %v, want ErrProviderAbsent", reserveErr)
+	}
+	if err = service.ReconfigureProviders(cfg); err != nil {
+		t.Fatalf("reconfigure with unresolvable acp owner failed: %v", err)
+	}
+	for _, role := range []harness.Role{harness.RoleChat, harness.RoleDeveloper, harness.RoleReviewer, harness.RoleNotification, harness.RoleHeartbeat} {
+		if got := harness.ExecutionProvider(runtime.AcquireRole(role), "gone-acp-role-probe"); got == "gone-acp" {
+			t.Fatalf("published role %q routes to unresolvable acp owner", role)
+		}
+	}
+	if release, reserveErr := harness.ReserveOwnedExecution(runtime.AcquireRole(harness.RoleDeveloper), "gone-acp-owner-reconciled", "gone-acp"); release != nil || !errors.Is(reserveErr, harness.ErrProviderAbsent) {
+		if release != nil {
+			release()
+		}
+		t.Fatalf("unresolvable acp owner reservation after reconfigure = %v, want ErrProviderAbsent", reserveErr)
+	}
+	after, err := os.ReadFile(leasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("unresolvable acp composition mutated durable lease")
+	}
+}
+
+func TestHarnessRuntimeSpecOmitsLegacyACPOwnerWithUnresolvableCommand(t *testing.T) {
+	cfg := durableOwnerCLIConfig(t)
+	cfg.Harness.ACPCommand = "definitely-not-installed-xyz"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "legacy-acp-command-spec")
+	defer runtimeState.Close()
+	spec := harnessRuntimeSpec(cfg, "test", runtimeState, "acp")
+	if _, ok := spec.Providers["acp"]; ok {
+		t.Fatalf("legacy acp owner with unresolvable command retained: %#v", spec.Providers)
+	}
+	registry := harness.NewBuiltinRegistry()
+	runtime, err := harness.NewRuntimeSpec(registry, spec)
+	if err != nil {
+		t.Fatalf("spec with unresolvable legacy acp owner rejected: %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuildServiceRetainsResolvedACPOwner(t *testing.T) {
+	cfg := durableOwnerCLIConfig(t)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Providers["live-acp"] = config.ProviderProfile{Harness: "acp", ACPCommand: executable}
+	cfg.Harness.ACPCommand = executable
+	if err = cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	writeDurableOwnerLease(t, cfg, "profile-acp-owner", "live-acp")
+	writeDurableOwnerLease(t, cfg, "legacy-acp-owner", "acp")
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	owners, err := orchestrator.DurableProviderOwners(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := harnessRuntimeSpec(cfg, "test", service.Runtime, owners...)
+	for _, owner := range []harness.ProviderID{"live-acp", "acp"} {
+		provider, ok := spec.Providers[owner]
+		if !ok {
+			t.Fatalf("resolved acp owner %q omitted: %#v", owner, spec.Providers)
+		}
+		if strings.TrimSpace(provider.Command) == "" {
+			t.Fatalf("resolved acp owner %q has an empty command", owner)
+		}
+	}
+	for role, provider := range spec.Roles {
+		if provider == "live-acp" || provider == "acp" {
+			t.Fatalf("retained acp owner gained synthetic role %q", role)
+		}
+	}
+	runtime := serviceProviderRuntime(t, service)
+	assertOwnedProviderPresentButUnstarted(t, runtime, "live-acp")
+	assertOwnedProviderPresentButUnstarted(t, runtime, "acp")
+}
+
+func TestBuildServiceRetainsValidLegacyCatalogKindOwner(t *testing.T) {
+	cfg := durableOwnerCLIConfig(t)
+	if _, ok := cfg.Harness.Providers["codex"]; ok {
+		t.Fatal("test scenario requires no named codex provider profile")
+	}
+	writeDurableOwnerLease(t, cfg, "legacy-owner", "codex")
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	owners, err := orchestrator.DurableProviderOwners(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := normalizeHarnessSpecForComparison(harnessRuntimeSpec(cfg, "test", service.Runtime, owners...))
+	retained, ok := spec.Providers[harness.ProviderID("codex")]
+	if !ok {
+		t.Fatalf("legacy catalog-kind owner omitted: %#v", spec.Providers)
+	}
+	expected := expectedLegacyHarnessConfig(cfg, "codex", "test", false)
+	if !reflect.DeepEqual(retained, expected) {
+		t.Fatalf("legacy owner composition = %#v, want %#v", retained, expected)
+	}
+	if got := spec.Roles[harness.RoleDeveloper]; got != "glm-dev" {
+		t.Fatalf("developer role = %q, want glm-dev", got)
+	}
+	for role, provider := range spec.Roles {
+		if provider == "codex" {
+			t.Fatalf("retained legacy owner gained synthetic role %q", role)
+		}
+	}
+	runtime := serviceProviderRuntime(t, service)
+	if got := harness.ExecutionProvider(runtime.AcquireRole(harness.RoleDeveloper), "legacy-role-probe"); got != "glm-dev" {
+		t.Fatalf("published developer role = %q, want glm-dev", got)
+	}
+	assertOwnedProviderPresentButUnstarted(t, runtime, "codex")
 }
 
 func TestHarnessRuntimeSpecLegacySingle(t *testing.T) {

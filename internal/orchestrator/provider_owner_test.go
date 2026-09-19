@@ -758,3 +758,80 @@ func TestNilProviderJSONUnchanged(t *testing.T) {
 		t.Fatalf("legacy provider = %q, want empty", loaded.Provider)
 	}
 }
+
+func TestDurableProviderOwnersAreExactDeterministicAndReadOnly(t *testing.T) {
+	cfg := providerOwnerConfig(t)
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+	for _, lease := range []Lease{
+		{ID: "empty", Provider: ""},
+		{ID: "codex-one", Provider: "codex-dev"},
+		{ID: "codex-two", Provider: "codex-dev"},
+		{ID: "same-kind-review", Provider: "claude-rev"},
+		{ID: "same-kind-architecture", Provider: "claude-arch"},
+	} {
+		if err := manager.saveLease(lease); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := make(map[string][]byte)
+	entries, err := os.ReadDir(manager.leaseDirectory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		data, readErr := os.ReadFile(filepath.Join(manager.leaseDirectory(), entry.Name()))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		before[entry.Name()] = data
+	}
+	owners, err := DurableProviderOwners(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []harness.ProviderID{"claude-arch", "claude-rev", "codex-dev"}
+	if !reflect.DeepEqual(owners, want) {
+		t.Fatalf("durable owners = %q, want %q", owners, want)
+	}
+	for name, wantBytes := range before {
+		got, readErr := os.ReadFile(filepath.Join(manager.leaseDirectory(), name))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !bytes.Equal(got, wantBytes) {
+			t.Fatalf("owner enumeration rewrote %s", name)
+		}
+	}
+}
+
+func TestDurableProviderOwnersSkipMalformedLease(t *testing.T) {
+	cfg := providerOwnerConfig(t)
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+	if err := manager.saveLease(Lease{ID: "valid-owner", Provider: "codex-dev"}); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := []byte("{not-json\n")
+	corruptPath := filepath.Join(manager.leaseDirectory(), "corrupt.json")
+	if err := os.WriteFile(corruptPath, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validPath := manager.leasePath("valid-owner")
+	validBefore, err := os.ReadFile(validPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owners, err := DurableProviderOwners(cfg)
+	if err != nil {
+		t.Fatalf("owner enumeration beside malformed lease failed: %v", err)
+	}
+	want := []harness.ProviderID{"codex-dev"}
+	if !reflect.DeepEqual(owners, want) {
+		t.Fatalf("durable owners beside malformed lease = %q, want %q", owners, want)
+	}
+	if data, readErr := os.ReadFile(corruptPath); readErr != nil || !bytes.Equal(data, corrupt) {
+		t.Fatalf("malformed lease changed: err = %v", readErr)
+	}
+	if data, readErr := os.ReadFile(validPath); readErr != nil || !bytes.Equal(data, validBefore) {
+		t.Fatalf("valid lease changed: err = %v", readErr)
+	}
+}
