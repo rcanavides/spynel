@@ -60,9 +60,9 @@ func (m *Manager) runSemanticHeartbeat(ctx context.Context) {
 	auditDone := make(chan time.Time, 1)
 	waitForProvider := func() {
 		auditActive = true
-		m.jobs.Add(1)
+		m.jobs.add()
 		go func() {
-			defer m.jobs.Done()
+			defer m.jobs.done()
 			completedAt, ok := m.waitForSemanticHeartbeatProviderRelease(ctx)
 			if !ok {
 				return
@@ -170,9 +170,9 @@ func (m *Manager) runSemanticHeartbeat(ctx context.Context) {
 		stopTimer()
 		m.setSemanticHeartbeatScheduleForTerm(true, time.Time{}, term)
 		auditActive = true
-		m.jobs.Add(1)
+		m.jobs.add()
 		go func(runCtx context.Context, runTerm uint64) {
-			defer m.jobs.Done()
+			defer m.jobs.done()
 			providerStarted := m.runSemanticHeartbeatOnceForTerm(runCtx, runTerm)
 			completedAt := time.Time{}
 			if providerStarted {

@@ -3,6 +3,7 @@ package localapi
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -28,6 +29,86 @@ func (h *gatedRunOnceHarness) Send(_ context.Context, key, _ string, emit core.E
 	<-h.release
 	emit(core.Event{Kind: core.EventFinal, Text: "done", Done: true})
 	return "thread-" + key, false, nil
+}
+
+type settlingRunOnceHarness struct {
+	*apiHarness
+	settle func()
+}
+
+func (h *settlingRunOnceHarness) Send(_ context.Context, key, _ string, emit core.Emit) (string, bool, error) {
+	h.settle()
+	emit(core.Event{Kind: core.EventFinal, Text: "done", ThreadID: "thread-" + key, Done: true})
+	return "thread-" + key, false, nil
+}
+
+// J16: the run-once endpoint settles the durable consequences of the work it
+// dispatched and returns 204, with all settlement owned by the shared
+// orchestrator RunOnce rather than endpoint logic.
+func TestRunOnceEndpointSettlesTransitionAndReturnsNoContent(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskPath, err := orchestrator.CreateWithOptions(cfg, "tasks", "settle over the local API", "", orchestrator.CreateOptions{NoReview: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Dir(filepath.Dir(taskPath))
+	working := filepath.Join(base, "working", filepath.Base(taskPath))
+	done := filepath.Join(base, "done", filepath.Base(taskPath))
+	target := &settlingRunOnceHarness{apiHarness: newAPIHarness(), settle: func() {
+		document, readErr := orchestrator.ReadDocument(working)
+		if readErr != nil {
+			t.Errorf("read working task: %v", readErr)
+			return
+		}
+		now := time.Now().UTC().Truncate(time.Second)
+		document.FrontMatter["status"] = "done"
+		document.FrontMatter["updated_at"] = now.Format(time.RFC3339)
+		document.FrontMatter["completion_summary"] = map[string]any{
+			"verdict": "completed", "outcome": "Collected the requested status.",
+			"evidence":     "Local status output only.",
+			"uncertainty":  "Remote health remains uncertain.",
+			"completed_at": now.Format(time.RFC3339),
+		}
+		if writeErr := orchestrator.WriteDocument(working, document); writeErr != nil {
+			t.Errorf("write settled task: %v", writeErr)
+			return
+		}
+		if renameErr := os.Rename(working, done); renameErr != nil {
+			t.Errorf("move settled task: %v", renameErr)
+		}
+	}}
+	service := app.New(cfg, target)
+	defer service.Close()
+	finished := 0
+	service.Orchestrator.JobStarted = func(orchestrator.Lease, string, time.Time, int, int) (int, error) {
+		return 7, nil
+	}
+	service.Orchestrator.JobFinished = func(int) { finished++ }
+	server := &Server{Service: service}
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest("POST", "/v1/run-once", nil)
+	server.runOnce(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("run once status = %d, body %s", response.Code, response.Body.String())
+	}
+	settled, err := orchestrator.ReadDocument(done)
+	if err != nil || settled.FrontMatter["status"] != "done" {
+		t.Fatalf("settled task = %v at %s, err %v", settled.FrontMatter["status"], done, err)
+	}
+	entries, err := os.ReadDir(cfg.StatePath("runtime", "leases"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("leases after settled run once = %d entries, err %v", len(entries), err)
+	}
+	if finished != 1 {
+		t.Fatalf("JobFinished calls = %d, want exactly 1", finished)
+	}
 }
 
 func TestRunOnceWaitsForDispatchedWorkAfterScanError(t *testing.T) {

@@ -84,7 +84,7 @@ type Manager struct {
 	inflight                    map[string]bool
 	runtimeJobs                 map[string]int
 	controlCancelled            map[string]int
-	jobs                        sync.WaitGroup
+	jobs                        pendingGroup
 	capacityMu                  sync.Mutex
 	capacityActive              int
 	capacityLimit               int
@@ -820,10 +820,10 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 	}
 
 	m.setInflight(lease.ID, true)
-	m.jobs.Add(1)
+	m.jobs.add()
 	go func() {
 		defer release()
-		defer m.jobs.Done()
+		defer m.jobs.done()
 		defer func() {
 			m.setInflight(lease.ID, false)
 			// Harness completion is the event that makes agent-authored durable
@@ -889,16 +889,39 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			m.setRuntimeJob(lease.ID, jobID)
 		}
 		finish := func() { m.finishRuntimeJob(lease.ID) }
+		// One-shot settlement tracks only this dispatch's provider turn: the
+		// gate is captured from the dispatch context, counted immediately
+		// before Send, and released exactly once by the first non-continuing
+		// terminal event — after its durable write on the normal path, or on
+		// the retired-runtime-job and lease-load-failure branches where this
+		// emit path intentionally performs no durable mutation — or by a Send
+		// error. Serve-style contexts carry no gate.
+		gate := settlementFrom(ctx)
+		var releaseSettlement sync.Once
+		release := func() {
+			if gate != nil {
+				releaseSettlement.Do(gate.done)
+			}
+		}
 		// Admission and asynchronous events must not overwrite each other's
 		// lease state (especially a terminal event racing Send's return).
 		var lifecycleMu sync.Mutex
 		emit := func(event core.Event) {
 			lifecycleMu.Lock()
 			defer lifecycleMu.Unlock()
+			terminal := event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+			settled := terminal && !event.Continues
 			if jobID > 0 && m.runtimeJob(lease.ID) != jobID {
+				// The runtime job was already retired, for example by another
+				// live-primary scan that reconciled this execution. This emit
+				// intentionally performs no durable mutation for the retired
+				// job, so a non-continuing terminal event may release the
+				// settlement gate before returning instead of leaking it.
+				if settled {
+					release()
+				}
 				return
 			}
-			terminal := event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError)
 			if jobID > 0 && m.JobEvent != nil {
 				m.JobEvent(jobID, event)
 			}
@@ -910,6 +933,9 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			if err != nil {
 				if terminal {
 					finish()
+				}
+				if settled {
+					release()
 				}
 				return
 			}
@@ -936,6 +962,14 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			}
 			// Terminal provider completion remains visible as awaiting_transition
 			// until reconciliation observes the agent-authored durable file move.
+			// Release settlement only after the terminal event's durable write
+			// and job bookkeeping have completed.
+			if settled {
+				release()
+			}
+		}
+		if gate != nil {
+			gate.add()
 		}
 		threadID, steered, err := m.harnessForPhase(lease.Phase).Send(ctx, lease.SessionKey, prompt, emit)
 		lifecycleMu.Lock()
@@ -948,6 +982,7 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 				m.JobExecutionUpdated(jobID, core.ExecutionStatus{State: "error", Detail: err.Error()})
 			}
 			finish()
+			release()
 			m.recordError(lease, err)
 			return
 		}
@@ -981,14 +1016,25 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 }
 
 func (m *Manager) reconcileTransitions(ctx context.Context) error {
+	_, err := m.reconcileTransitionsCount(ctx)
+	return err
+}
+
+// reconcileTransitionsCount reconciles eligible durable transitions and also
+// reports how many leases actually reached the reconciliation point where the
+// lease is removed and finishRuntimeJob is invoked. Inspected or failed
+// candidates are never counted; their per-lease failures still allow
+// unrelated leases to reconcile.
+func (m *Manager) reconcileTransitionsCount(ctx context.Context) (int, error) {
 	leases, err := m.loadLeases()
 	if err != nil {
-		return err
+		return 0, err
 	}
+	reconciled := 0
 	var errs []error
 	for _, lease := range leases {
 		if err := ctx.Err(); err != nil {
-			return errors.Join(append(errs, err)...)
+			return reconciled, errors.Join(append(errs, err)...)
 		}
 		if lease.State == "claiming" {
 			continue
@@ -1037,6 +1083,7 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 			}
 			_ = os.Remove(m.leasePath(lease.ID))
 			m.finishRuntimeJob(lease.ID)
+			reconciled++
 			continue
 		}
 		phase := normalizeLeasePhase(route.Name, lease.Phase)
@@ -1053,6 +1100,7 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 		}
 		_ = os.Remove(m.leasePath(lease.ID))
 		m.finishRuntimeJob(lease.ID)
+		reconciled++
 		if route.Name == "goals" && phase == phaseGoalReview && status == "planning" {
 			if err := m.startExistingClaim(ctx, route, path, phaseGoalPlanning, false, true); err != nil {
 				errs = append(errs, fmt.Errorf("lease %s: continue goal planning at %s: %w", lease.ID, path, err))
@@ -1060,7 +1108,7 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 			}
 		}
 	}
-	return errors.Join(errs...)
+	return reconciled, errors.Join(errs...)
 }
 
 func normalizeLeasePhase(routeName, phase string) string {
@@ -1894,7 +1942,7 @@ func (m *Manager) relatedTasksForGoal(file string) string {
 	return strings.Join(lines, "\n")
 }
 
-func (m *Manager) Wait() { m.jobs.Wait() }
+func (m *Manager) Wait() { m.jobs.waitBackground() }
 
 func (m *Manager) WaitForIdle(ctx context.Context) error {
 	ticker := time.NewTicker(200 * time.Millisecond)
@@ -1912,8 +1960,7 @@ func (m *Manager) WaitForIdle(ctx context.Context) error {
 			}
 		}
 		if !busy {
-			m.jobs.Wait()
-			return nil
+			return m.jobs.wait(ctx)
 		}
 		select {
 		case <-ctx.Done():

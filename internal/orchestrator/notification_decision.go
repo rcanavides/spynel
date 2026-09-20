@@ -34,9 +34,9 @@ func (m *Manager) notificationTimeout() time.Duration {
 // task-log writes belong entirely to that agent; Spynel does not persist or
 // interpret a notification-specific result.
 func (m *Manager) startTaskNotificationAgent(parent context.Context, lease Lease, outcome, taskFile string) {
-	m.jobs.Add(1)
+	m.jobs.add()
 	go func() {
-		defer m.jobs.Done()
+		defer m.jobs.done()
 		m.runTaskNotificationAgent(parent, lease, outcome, taskFile)
 	}()
 }

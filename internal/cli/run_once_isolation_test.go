@@ -58,7 +58,7 @@ func TestRunOnceWaitsForDispatchedWorkAfterScanError(t *testing.T) {
 	target := &signaledRunOnceHarness{heldCLIHarness: newHeldCLIHarness(), entered: make(chan string, 1)}
 	manager := orchestrator.New(cfg, target, extensions.Runner{})
 	done := make(chan error, 1)
-	go func() { done <- scanAndWaitForIdle(context.Background(), manager) }()
+	go func() { done <- manager.RunOnce(context.Background()) }()
 	var key string
 	select {
 	case key = <-target.entered:

@@ -411,9 +411,7 @@ func (s *Server) settings(response http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) runOnce(response http.ResponseWriter, request *http.Request) {
-	scanErr := s.Service.Orchestrator.ScanOnce(request.Context())
-	waitErr := s.Service.Orchestrator.WaitForIdle(request.Context())
-	if err := errors.Join(scanErr, waitErr); err != nil {
+	if err := s.Service.Orchestrator.RunOnce(request.Context()); err != nil {
 		writeError(response, err)
 		return
 	}
