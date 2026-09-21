@@ -47,7 +47,8 @@ type piSession struct {
 type piProcess struct {
 	owner  *Pi
 	key    string
-	cmd    *exec.Cmd
+	proc   *providerProcess
+	ctx    context.Context
 	cancel context.CancelFunc
 	stdin  io.WriteCloser
 
@@ -556,28 +557,16 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 	if cfg.Sandbox == "read-only" {
 		args = append(args, "--tools", "read,grep,find,ls")
 	}
-	command := exec.CommandContext(processContext, cfg.Command, args...)
-	command.Dir = cfg.Cwd
-	stdout, err := command.StdoutPipe()
+	provider, err := startProviderProcess(processSpec{
+		Path: cfg.Command, Args: args, Dir: cfg.Cwd, Stderr: cfg.Stderr,
+	})
 	if err != nil {
-		cancel()
-		return nil, err
-	}
-	stdin, err := command.StdinPipe()
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	if cfg.Stderr != nil {
-		command.Stderr = cfg.Stderr
-	}
-	if err := command.Start(); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start Pi RPC process: %w", err)
 	}
-	process := &piProcess{owner: p, key: key, cmd: command, cancel: cancel, stdin: stdin, nextID: 1, pending: map[string]chan piResponse{}}
-	go process.readLoop(stdout)
-	go process.waitLoop()
+	process := &piProcess{owner: p, key: key, proc: provider, ctx: processContext, cancel: cancel, stdin: provider.Stdin(), nextID: 1, pending: map[string]chan piResponse{}}
+	go process.readLoop(provider)
+	go process.observeExit()
 	data, err := process.call(ctx, map[string]any{"type": "get_state"}, nil)
 	if err != nil {
 		process.close()
@@ -662,11 +651,17 @@ func (process *piProcess) call(ctx context.Context, message map[string]any, befo
 		delete(process.pending, id)
 		process.mu.Unlock()
 		return nil, ctx.Err()
+	case <-process.ctx.Done():
+		process.mu.Lock()
+		delete(process.pending, id)
+		process.mu.Unlock()
+		return nil, process.ctx.Err()
 	}
 }
 
-func (process *piProcess) readLoop(reader io.Reader) {
-	scanner := bufio.NewScanner(reader)
+func (process *piProcess) readLoop(provider *providerProcess) {
+	defer provider.CloseStdout()
+	scanner := bufio.NewScanner(provider.Stdout())
 	scanner.Buffer(make([]byte, 64*1024), piRPCMaxRecord)
 	for scanner.Scan() {
 		var envelope piWireMessage
@@ -891,8 +886,14 @@ func (process *piProcess) finishTurn(turn *piTurn) {
 		Execution: &core.ExecutionStatus{State: "finishing"}})
 }
 
-func (process *piProcess) waitLoop() {
-	err := process.cmd.Wait()
+func (process *piProcess) observeExit() {
+	exit := process.proc.Result()
+	if exit.requested {
+		// A requested stop is normal shutdown; close owns its cleanup and the
+		// exit must not surface as a spontaneous Pi RPC failure.
+		return
+	}
+	err := exit.err
 	if err == nil {
 		err = errors.New("Pi RPC process exited")
 	}
@@ -911,6 +912,7 @@ func (process *piProcess) fail(err error) {
 	turn := process.active
 	process.active = nil
 	process.stdin = nil
+	proc := process.proc
 	cancel := process.cancel
 	process.mu.Unlock()
 	if cancel != nil {
@@ -930,8 +932,31 @@ func (process *piProcess) fail(err error) {
 		}
 		process.owner.mu.Unlock()
 	}
+	// The process may still be running behind a broken transport; the failed
+	// session owns exactly one bounded stop before its cleanup is complete.
+	// A stop failure here is shutdown diagnostics on top of the primary
+	// failure; it never re-enters failure handling or fabricates a turn
+	// failure for a session that is already closed.
+	if proc != nil {
+		if err := proc.Stop(context.Background()); err != nil {
+			process.logStopFailure(err)
+		}
+	}
 }
 
+// logStopFailure reports a failed bounded stop as shutdown diagnostics through
+// the owner's configured stderr channel.
+func (process *piProcess) logStopFailure(err error) {
+	if owner := process.owner; owner != nil && owner.config.Stderr != nil {
+		_, _ = fmt.Fprintf(owner.config.Stderr, "stop Pi RPC process: %v\n", err)
+	}
+}
+
+// close terminates this Pi process session. The providerProcess stop gives the
+// process cooperative stdin EOF first, then bounded escalation, so a Pi that
+// ignores EOF can never outlive its session. A failed stop is logged, never
+// discarded, and never turned into a turn failure after the session has
+// already closed.
 func (process *piProcess) close() {
 	process.mu.Lock()
 	if process.closed {
@@ -939,12 +964,14 @@ func (process *piProcess) close() {
 		return
 	}
 	process.closed = true
-	stdin := process.stdin
 	process.stdin = nil
+	proc := process.proc
 	cancel := process.cancel
 	process.mu.Unlock()
-	if stdin != nil {
-		_ = stdin.Close()
+	if proc != nil {
+		if err := proc.Stop(context.Background()); err != nil {
+			process.logStopFailure(err)
+		}
 	}
 	if cancel != nil {
 		cancel()

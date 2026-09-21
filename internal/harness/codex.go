@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -37,7 +36,7 @@ type Codex struct {
 	config CodexConfig
 	ctx    context.Context
 	cancel context.CancelFunc
-	cmd    *exec.Cmd
+	proc   *providerProcess
 	stdin  io.WriteCloser
 
 	writeMu sync.Mutex
@@ -239,35 +238,27 @@ func (c *Codex) Models(ctx context.Context) ([]Model, error) {
 
 func (c *Codex) Start(parent context.Context) error {
 	c.mu.Lock()
-	if c.cmd != nil {
+	if c.proc != nil {
 		c.mu.Unlock()
 		return nil
 	}
 	c.ctx, c.cancel = context.WithCancel(parent)
-	c.cmd = exec.CommandContext(c.ctx, c.config.Command, "app-server", "--stdio")
-	c.cmd.Dir = c.config.Cwd
-	stdout, err := c.cmd.StdoutPipe()
+	process, err := startProviderProcess(processSpec{
+		Path: c.config.Command, Args: []string{"app-server", "--stdio"}, Dir: c.config.Cwd,
+		Stderr: c.config.Stderr,
+	})
 	if err != nil {
-		c.mu.Unlock()
-		return err
-	}
-	stdin, err := c.cmd.StdinPipe()
-	if err != nil {
-		c.mu.Unlock()
-		return err
-	}
-	c.stdin = stdin
-	if c.config.Stderr != nil {
-		c.cmd.Stderr = c.config.Stderr
-	}
-	if err := c.cmd.Start(); err != nil {
-		c.cmd = nil
+		c.cancel()
+		c.ctx = nil
+		c.cancel = nil
 		c.mu.Unlock()
 		return fmt.Errorf("start codex app-server: %w", err)
 	}
+	c.proc = process
+	c.stdin = process.Stdin()
 	c.mu.Unlock()
-	go c.readLoop(stdout)
-	go c.waitLoop()
+	go c.readLoop(process)
+	go c.observeExit(process)
 
 	params := map[string]any{
 		"clientInfo":   map[string]any{"name": "spynel", "title": "Spynel", "version": c.config.Version},
@@ -275,15 +266,24 @@ func (c *Codex) Start(parent context.Context) error {
 	}
 	result, err := c.call(parent, "initialize", params)
 	if err != nil {
-		_ = c.Close()
+		c.closeOnStartFailure()
 		return fmt.Errorf("Codex executable %q failed app-server initialization: %w", c.config.Command, err)
 	}
 	var initialized map[string]json.RawMessage
 	if err := json.Unmarshal(result, &initialized); err != nil || initialized == nil {
-		_ = c.Close()
+		c.closeOnStartFailure()
 		return fmt.Errorf("Codex executable %q returned an incompatible initialize result; expected the documented app-server object", c.config.Command)
 	}
 	return c.notify("initialized", map[string]any{})
+}
+
+// closeOnStartFailure performs Close cleanup on a failed startup or transport
+// path: the original failure stays primary, and a failed provider stop is
+// logged as shutdown diagnostics instead of disappearing or displacing it.
+func (c *Codex) closeOnStartFailure() {
+	if err := c.Close(); err != nil && c.config.Stderr != nil {
+		_, _ = fmt.Fprintf(c.config.Stderr, "stop codex app-server: %v\n", err)
+	}
 }
 
 func (c *Codex) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
@@ -828,7 +828,14 @@ func (c *Codex) write(message any) error {
 	return err
 }
 
-func (c *Codex) readLoop(reader io.Reader) {
+func (c *Codex) readLoop(process *providerProcess) {
+	defer process.CloseStdout()
+	c.scanLoop(process.Stdout())
+}
+
+// scanLoop consumes provider stdout records. It is separated from readLoop so
+// drain fixtures can drive the same protocol parsing over in-memory readers.
+func (c *Codex) scanLoop(reader io.Reader) {
 	const maxMessage = 16 * 1024 * 1024
 	oversized := "message (header unavailable)"
 	scanner := bufio.NewScanner(reader)
@@ -924,14 +931,14 @@ func (c *Codex) describeFrame(prefix []byte) string {
 	return "message (header unavailable)"
 }
 
-func (c *Codex) waitLoop() {
-	c.mu.Lock()
-	cmd := c.cmd
-	c.mu.Unlock()
-	if cmd == nil {
+func (c *Codex) observeExit(process *providerProcess) {
+	exit := process.Result()
+	if exit.requested {
+		// A requested stop is normal shutdown, not a spontaneous
+		// app-server crash; Close owns requested-exit cleanup.
 		return
 	}
-	err := cmd.Wait()
+	err := exit.err
 	if err == nil {
 		err = errors.New("codex app-server exited")
 	}
@@ -953,9 +960,12 @@ func (c *Codex) failAll(err error) {
 	c.active = map[string]*turnState{}
 	c.deferred = map[string][]wireMessage{}
 	c.mu.Unlock()
-	// Close stdin as well as cancelling the process: an npm launcher may have
-	// a native child that must receive EOF even if its wrapper is killed.
-	_ = c.Close()
+	// Close performs the bounded requested process stop, including the
+	// cooperative stdin EOF an npm-launched native child needs, before the
+	// protocol context is cancelled. Its stop failure is shutdown
+	// diagnostics on top of the primary transport failure; it never
+	// re-enters failure handling.
+	c.closeOnStartFailure()
 	for _, waiter := range pending {
 		waiter.response <- rpcResponse{Error: &rpcError{Code: -1, Message: err.Error()}}
 	}
@@ -972,17 +982,23 @@ func (c *Codex) Close() error {
 		return nil
 	}
 	c.closed = true
-	stdin := c.stdin
+	proc := c.proc
 	c.stdin = nil
 	cancel := c.cancel
 	c.mu.Unlock()
-	if stdin != nil {
-		_ = stdin.Close()
+	// Stop the process before cancelling the protocol context so the
+	// app-server receives cooperative EOF, flushes, and the reader drains
+	// before pending turns are torn down. Cancellation still runs when the
+	// stop reports a failure, and that failure is the Close result instead
+	// of being discarded.
+	var stopErr error
+	if proc != nil {
+		stopErr = proc.Stop(context.Background())
 	}
 	if cancel != nil {
 		cancel()
 	}
-	return nil
+	return stopErr
 }
 
 func (c *Codex) loadSessions() error {

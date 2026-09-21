@@ -136,6 +136,14 @@ func portableHarnessFixture(t *testing.T, mode string) (command, cwd, logPath st
 	logPath = filepath.Join(root, "fixture evidence 日志.jsonl")
 	t.Setenv(fixtureModeEnv, mode)
 	t.Setenv(fixtureLogEnv, logPath)
+	if os.Getenv("GORACE") == "" {
+		// Provider stops now prefer cooperative stdin EOF, so fixture children
+		// exit normally instead of dying to a context kill. The race runtime's
+		// default exit flush delay would otherwise add a fixed second to every
+		// fixture exit and dominate race-mode runs; these synthetic provider
+		// processes do not need it. An explicit developer GORACE wins.
+		t.Setenv("GORACE", "atexit_sleep_ms=0")
+	}
 	return command, cwd, logPath
 }
 
@@ -173,6 +181,12 @@ func runHarnessFixture(mode string) int {
 		return runPiFixture(mode)
 	case "acp-lifecycle", "acp-interrupt", "acp-version-mismatch", "acp-session-error", "acp-late-final-chunk":
 		return runACPFixture(mode)
+	case "proc-exit-nonzero":
+		// Models a provider that fails immediately with exit status 7 and no
+		// stop request, so natural-failure classification stays observable.
+		return 7
+	case "proc-cooperative", "proc-ignore-eof", "proc-hold", "proc-spawn-child", "proc-descendant":
+		return runProcessLifecycleFixture(mode)
 	default:
 		_, _ = fmt.Fprintf(os.Stderr, "unknown harness fixture mode %q\n", mode)
 		return 2

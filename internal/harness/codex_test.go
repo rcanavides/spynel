@@ -199,7 +199,7 @@ func TestCodexDeferredNotificationsPreserveWireOrder(t *testing.T) {
 	codex.session["fixture"] = "thread"
 	codex.loaded["thread"] = true
 	readDone := make(chan struct{})
-	go func() { codex.readLoop(responses); close(readDone) }()
+	go func() { codex.scanLoop(responses); close(readDone) }()
 	retryEntered := make(chan struct{})
 	releaseRetry := make(chan struct{})
 	var release sync.Once
@@ -454,26 +454,26 @@ func TestCodexAppServerStartsThreadsStreamsAndSteers(t *testing.T) {
 }
 
 func TestCodexTransportLossEmitsStructuredFatalFailure(t *testing.T) {
+	command, root, _ := portableHarnessFixture(t, "codex-lifecycle")
+	process, err := startProviderProcess(processSpec{Path: command, Args: []string{"app-server", "--stdio"}, Dir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
 	events := make(chan core.Event, 1)
-	input, writer := io.Pipe()
-	defer input.Close()
-	defer writer.Close()
-	codex := &Codex{pending: map[int]codexPendingCall{}, active: map[string]*turnState{
+	codex := &Codex{proc: process, stdin: process.Stdin(), pending: map[int]codexPendingCall{}, active: map[string]*turnState{
 		"thread": {threadID: "thread", turnID: "turn", emit: func(event core.Event) { events <- event }},
-	}, stdin: writer}
+	}}
 	codex.failAll(errors.New("connection lost"))
-	eof := make(chan error, 1)
-	go func() {
-		_, err := input.Read(make([]byte, 1))
-		eof <- err
-	}()
+	// Failure cleanup owns the provider stop, so the app-server's input must
+	// reach EOF behind its launcher and the process must exit.
 	select {
-	case err := <-eof:
-		if err != io.EOF {
-			t.Fatalf("provider input after failure = %v, want EOF", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("failed transport left provider input open behind its launcher")
+	case <-process.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("failed transport left the provider process running")
+	}
+	exit := process.Result()
+	if !exit.requested {
+		t.Fatal("failure cleanup did not classify the provider stop as requested")
 	}
 	event := <-events
 	if !event.Done || event.Kind != core.EventError || event.Execution == nil || event.Execution.State != "error" || !strings.Contains(event.Execution.Detail, "connection lost") {
@@ -484,7 +484,10 @@ func TestCodexTransportLossEmitsStructuredFatalFailure(t *testing.T) {
 func TestCodexOversizedMessageStopsProviderAndReportsUnavailable(t *testing.T) {
 	command, root, logPath := portableHarnessFixture(t, "codex-stream-overflow")
 	supervisor := NewSupervisor(NewBuiltinRegistry(), HarnessConfig{Name: "codex", Command: command, Cwd: root})
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// The provider stop after a broken transport is bounded-synchronous by
+	// design: cooperative EOF grace plus TERM and KILL escalation can take up
+	// to roughly seven seconds before the replacement connection is probed.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := supervisor.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -613,7 +616,7 @@ func (c codexExitAfterReply) Write(data []byte) (int, error) {
 	if err := json.Unmarshal(data, &request); err != nil {
 		return 0, err
 	}
-	c.readLoop(strings.NewReader(`{"id":` + string(request.ID) + `,"result":{"turn":{"id":"turn"}}}` + "\n"))
+	c.scanLoop(strings.NewReader(`{"id":` + string(request.ID) + `,"result":{"turn":{"id":"turn"}}}` + "\n"))
 	return len(data), nil
 }
 

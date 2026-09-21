@@ -37,7 +37,7 @@ func newACPDrainFixture(t *testing.T) *acpDrainFixture {
 		sessions:    map[string]acpSession{"key": {ID: "session"}},
 		active:      map[string]*acpTurn{"key": f.turn},
 	}
-	go f.adapter.readLoop(reader)
+	go f.adapter.scanLoop(reader)
 	go f.adapter.awaitPrompt("key", "session", f.turn, waiter)
 	return f
 }

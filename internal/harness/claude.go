@@ -12,7 +12,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,7 +47,7 @@ type claudeSession struct {
 type claudeTurn struct {
 	key        string
 	executable string
-	cmd        *exec.Cmd
+	proc       *providerProcess
 	cancel     context.CancelFunc
 	ready      chan error
 	done       chan struct{}
@@ -391,7 +390,10 @@ func (c *Claude) resumeSessionLocked(key string, cfg HarnessConfig) string {
 }
 
 func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previousSession string, cfg HarnessConfig, emit core.Emit) (string, bool, error) {
-	turnContext, cancel := context.WithCancel(baseContext)
+	// The turn context is local cleanup only: it releases the admission
+	// context registration and never owns process termination. providerProcess
+	// Stop owns the process, so a turn cancel cannot kill anything by itself.
+	_, cancel := context.WithCancel(baseContext)
 	streamingInput := claudeUsesStreamingInput(cfg)
 	args := []string{"-p"}
 	if streamingInput {
@@ -408,45 +410,44 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 		args = append(args, "--effort", cfg.Effort)
 	}
 	args = append(args, claudePermissionArgs(cfg)...)
-	cmd := exec.CommandContext(turnContext, cfg.Command, args...)
-	cmd.Dir = cfg.Cwd
-	var stdin io.WriteCloser
-	if streamingInput {
-		var err error
-		stdin, err = cmd.StdinPipe()
-		if err != nil {
-			cancel()
-			return "", false, err
-		}
-	} else {
-		cmd.Stdin = strings.NewReader(prompt)
+	turn := &claudeTurn{
+		key: key, executable: cfg.Command, cancel: cancel, emit: emit, accepting: streamingInput,
+		ready: make(chan error, 1), done: make(chan struct{}), stderr: newTailBuffer(64 * 1024),
 	}
-	stdout, err := cmd.StdoutPipe()
+	diagnosticOutput := io.Writer(turn.stderr)
+	if cfg.Stderr != nil {
+		diagnosticOutput = io.MultiWriter(cfg.Stderr, turn.stderr)
+	}
+	proc, err := startProviderProcess(processSpec{
+		Path: cfg.Command, Args: args, Dir: cfg.Cwd,
+		Stderr: &claudeLifecycleWriter{dst: diagnosticOutput, turn: turn},
+	})
 	if err != nil {
 		cancel()
-		return "", false, err
-	}
-	stderr := newTailBuffer(64 * 1024)
-	turn := &claudeTurn{
-		key: key, executable: cfg.Command, cmd: cmd, cancel: cancel, emit: emit, stdin: stdin, accepting: streamingInput,
-		ready: make(chan error, 1), done: make(chan struct{}), stderr: stderr,
-	}
-	diagnosticOutput := io.Writer(stderr)
-	if cfg.Stderr != nil {
-		diagnosticOutput = io.MultiWriter(cfg.Stderr, stderr)
-	}
-	cmd.Stderr = &claudeLifecycleWriter{dst: diagnosticOutput, turn: turn}
-	if err := cmd.Start(); err != nil {
-		cancel()
 		return "", false, fmt.Errorf("start Claude Code: %w", err)
+	}
+	turn.proc = proc
+	if streamingInput {
+		turn.stdin = proc.Stdin()
+	} else {
+		// Ordinary text input mirrors the previous in-process reader: the
+		// whole prompt and then EOF, without blocking turn admission on a
+		// provider that consumes its input slowly.
+		go func() {
+			_, _ = proc.Stdin().Write([]byte(prompt))
+			_ = proc.Stdin().Close()
+		}()
 	}
 	c.mu.Lock()
 	c.active[key] = turn
 	c.mu.Unlock()
-	go c.runTurn(turn, stdout)
+	go c.runTurn(turn, proc)
 	if streamingInput {
 		if _, err := turn.writePrompt(prompt, nil, false); err != nil {
-			cancel()
+			if stopErr := turn.proc.Stop(context.Background()); stopErr != nil {
+				c.logStopFailure(cfg.Stderr, stopErr)
+			}
+			turn.cancel()
 			return "", false, fmt.Errorf("send initial Claude Code prompt: %w", err)
 		}
 	}
@@ -454,14 +455,34 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 	select {
 	case err := <-turn.ready:
 		if err != nil {
+			turn.cancel()
 			return "", false, err
 		}
 		return turn.sessionID, false, nil
 	case <-ctx.Done():
-		cancel()
+		// The caller context only governs this admission wait; abandoning it
+		// must stop the process it started rather than orphaning it.
+		if stopErr := turn.proc.Stop(context.Background()); stopErr != nil {
+			c.logStopFailure(cfg.Stderr, stopErr)
+		}
+		turn.cancel()
 		return "", false, ctx.Err()
 	case <-baseContext.Done():
+		if stopErr := turn.proc.Stop(context.Background()); stopErr != nil {
+			c.logStopFailure(cfg.Stderr, stopErr)
+		}
+		turn.cancel()
 		return "", false, baseContext.Err()
+	}
+}
+
+// logStopFailure reports a failed bounded process stop as shutdown
+// diagnostics through the configured stderr channel. It never changes turn
+// semantics or emits a second terminal event; the turn's own outcome stays
+// untouched.
+func (c *Claude) logStopFailure(stderr io.Writer, err error) {
+	if stderr != nil {
+		_, _ = fmt.Fprintf(stderr, "stop Claude Code process: %v\n", err)
 	}
 }
 
@@ -605,8 +626,9 @@ func (turn *claudeTurn) replaceEmit(emit core.Emit) core.Emit {
 	return previous
 }
 
-func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
-	scanner := bufio.NewScanner(reader)
+func (c *Claude) runTurn(turn *claudeTurn, proc *providerProcess) {
+	defer proc.CloseStdout()
+	scanner := bufio.NewScanner(proc.Stdout())
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	completed := false
 	var terminal core.Event
@@ -625,6 +647,11 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 		if turn.sessionID == "" && event.Type != "system" {
 			terminal = core.Event{Kind: core.EventError, Text: fmt.Sprintf("Claude Code executable %q returned an incompatible stream: expected system/init with required session_id before output; update Claude Code or select another harness", turn.executable), Done: true}
 			completed = true
+			// An incompatible stream must stop the process; it must not be
+			// left running behind a half-parsed output contract.
+			if stopErr := turn.proc.Stop(context.Background()); stopErr != nil {
+				c.logStopFailure(c.config.Stderr, stopErr)
+			}
 			turn.cancel()
 			break
 		}
@@ -676,20 +703,27 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 			turn.closeInput()
 		}
 	}
-	waitErr := turn.cmd.Wait()
+	if !completed && scanner.Err() != nil {
+		// A broken or oversized stream can leave the process running; stop it
+		// before waiting for exit so the turn still settles within the bound.
+		if stopErr := turn.proc.Stop(context.Background()); stopErr != nil {
+			c.logStopFailure(c.config.Stderr, stopErr)
+		}
+	}
+	// Wait for print mode to exit before releasing the session. Closing its
+	// streaming input after the result keeps each Spynel execution bounded.
+	exit := turn.proc.Result()
 	turn.cancel()
 	if completed {
-		if waitErr != nil && c.config.Stderr != nil {
-			_, _ = fmt.Fprintf(c.config.Stderr, "Claude Code returned a result but its process failed: %v\n", waitErr)
+		if exit.err != nil && c.config.Stderr != nil {
+			_, _ = fmt.Fprintf(c.config.Stderr, "Claude Code returned a result but its process failed: %v\n", exit.err)
 		}
-		// Wait for print mode to exit before releasing the session. Closing its
-		// streaming input after the result keeps each Spynel execution bounded.
 		c.finishClaudeTurn(turn, terminal)
 		return
 	}
 	err := scanner.Err()
 	if err == nil {
-		err = waitErr
+		err = exit.err
 	}
 	message := "Claude Code stopped before returning a final response"
 	if turn.sessionID == "" {
@@ -750,9 +784,10 @@ func (c *Claude) Interrupt(_ context.Context, key string) (bool, error) {
 		return false, nil
 	}
 	turn.cancel()
-	if runtime.GOOS != "windows" && turn.cmd.Process != nil {
-		_ = turn.cmd.Process.Signal(os.Interrupt)
-	}
+	// Interruption stays an interrupt: group SIGINT on Unix, and the
+	// direct-process termination fallback on Windows. It never runs the
+	// full stop escalation.
+	_ = turn.proc.Interrupt()
 	return true, nil
 }
 
@@ -797,7 +832,13 @@ func (c *Claude) Close() error {
 	if cancel != nil {
 		cancel()
 	}
+	// Every active turn is stopped explicitly; process termination is owned
+	// by providerProcess, not by context cancellation. A failed stop is
+	// logged as shutdown diagnostics and never changes turn semantics.
 	for _, turn := range turns {
+		if stopErr := turn.proc.Stop(context.Background()); stopErr != nil {
+			c.logStopFailure(c.config.Stderr, stopErr)
+		}
 		turn.cancel()
 	}
 	return nil

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -40,7 +39,7 @@ type ACP struct {
 	mu          sync.Mutex
 	ctx         context.Context
 	cancel      context.CancelFunc
-	cmd         *exec.Cmd
+	proc        *providerProcess
 	stdin       io.WriteCloser
 	nextID      uint64
 	pending     map[string]chan acpResponse
@@ -144,6 +143,15 @@ func NewACP(cfg HarnessConfig) (*ACP, error) {
 
 func (a *ACP) FollowUpMode() FollowUpMode { return FollowUpQueue }
 
+// closeOnStartFailure performs Close cleanup on a failed Start path: the
+// original startup failure stays primary, and a failed provider stop is
+// logged as shutdown diagnostics instead of disappearing or displacing it.
+func (a *ACP) closeOnStartFailure() {
+	if err := a.Close(); err != nil && a.config.Stderr != nil {
+		_, _ = fmt.Fprintf(a.config.Stderr, "stop ACP agent process: %v\n", err)
+	}
+}
+
 func (a *ACP) Start(parent context.Context) error {
 	a.mu.Lock()
 	if a.ctx != nil {
@@ -160,43 +168,27 @@ func (a *ACP) Start(parent context.Context) error {
 		return fmt.Errorf("ACP working directory %q is unavailable", a.config.Cwd)
 	}
 	a.ctx, a.cancel = context.WithCancel(parent)
-	command := exec.CommandContext(a.ctx, a.config.Command, a.config.Args...)
-	command.Dir = a.config.Cwd
+	env := []string(nil)
 	if len(a.config.Env) != 0 {
-		command.Env = append(os.Environ(), a.config.Env...)
+		env = append(os.Environ(), a.config.Env...)
 	}
-	stdout, err := command.StdoutPipe()
+	process, err := startProviderProcess(processSpec{
+		Path: a.config.Command, Args: a.config.Args, Dir: a.config.Cwd,
+		Env: env, Stderr: a.config.Stderr,
+	})
 	if err != nil {
-		a.cancel()
-		a.ctx = nil
-		a.cancel = nil
-		a.mu.Unlock()
-		return err
-	}
-	stdin, err := command.StdinPipe()
-	if err != nil {
-		a.cancel()
-		a.ctx = nil
-		a.cancel = nil
-		a.mu.Unlock()
-		return err
-	}
-	if a.config.Stderr != nil {
-		command.Stderr = a.config.Stderr
-	}
-	if err := command.Start(); err != nil {
 		a.cancel()
 		a.ctx = nil
 		a.cancel = nil
 		a.mu.Unlock()
 		return fmt.Errorf("start ACP agent %q: %w", a.config.Command, err)
 	}
-	a.cmd = command
-	a.stdin = stdin
+	a.proc = process
+	a.stdin = process.Stdin()
 	a.nextID = 1
 	a.mu.Unlock()
-	go a.readLoop(stdout)
-	go a.waitLoop()
+	go a.readLoop(process)
+	go a.observeExit(process)
 
 	version := strings.TrimSpace(a.config.Version)
 	if version == "" {
@@ -211,7 +203,7 @@ func (a *ACP) Start(parent context.Context) error {
 		"clientInfo": map[string]string{"name": "spynel", "title": "Spynel", "version": version},
 	})
 	if err != nil {
-		_ = a.Close()
+		a.closeOnStartFailure()
 		return fmt.Errorf("initialize ACP agent %q: %w", a.config.Command, err)
 	}
 	var initialized struct {
@@ -219,11 +211,11 @@ func (a *ACP) Start(parent context.Context) error {
 		AgentCapabilities acpAgentCapabilities `json:"agentCapabilities"`
 	}
 	if err := json.Unmarshal(result, &initialized); err != nil {
-		_ = a.Close()
+		a.closeOnStartFailure()
 		return fmt.Errorf("decode ACP initialize response: %w", err)
 	}
 	if initialized.ProtocolVersion != acpProtocolVersion {
-		_ = a.Close()
+		a.closeOnStartFailure()
 		return fmt.Errorf("ACP agent selected protocol version %d; Spynel requires stable v1", initialized.ProtocolVersion)
 	}
 	a.mu.Lock()
@@ -460,17 +452,22 @@ func (a *ACP) Close() error {
 		return nil
 	}
 	a.closed = true
-	cancel := a.cancel
-	stdin := a.stdin
+	proc := a.proc
 	a.stdin = nil
 	a.mu.Unlock()
-	if stdin != nil {
-		_ = stdin.Close()
+	// Stop the process before cancelling the protocol context so the
+	// provider receives cooperative EOF, can flush, and the reader drains
+	// before protocol cancellation tears down pending turns. Cancellation
+	// still runs when the stop reports a failure, and that failure is the
+	// Close result instead of being discarded.
+	var stopErr error
+	if proc != nil {
+		stopErr = proc.Stop(context.Background())
 	}
-	if cancel != nil {
+	if cancel := a.cancel; cancel != nil {
 		cancel()
 	}
-	return nil
+	return stopErr
 }
 
 func (a *ACP) ensureSession(ctx context.Context, key, model string) (acpSession, error) {
@@ -649,7 +646,14 @@ func writeACP(writer io.Writer, value any) error {
 	return err
 }
 
-func (a *ACP) readLoop(reader io.Reader) {
+func (a *ACP) readLoop(process *providerProcess) {
+	defer process.CloseStdout()
+	a.scanLoop(process.Stdout())
+}
+
+// scanLoop consumes provider stdout records. It is separated from readLoop so
+// drain fixtures can drive the same protocol parsing over in-memory readers.
+func (a *ACP) scanLoop(reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), acpMaxRecord)
 	for scanner.Scan() {
@@ -895,8 +899,14 @@ func (a *ACP) respond(value any) error {
 	return writeACP(stdin, value)
 }
 
-func (a *ACP) waitLoop() {
-	err := a.cmd.Wait()
+func (a *ACP) observeExit(process *providerProcess) {
+	exit := process.Result()
+	if exit.requested {
+		// Requested shutdown is not a spontaneous provider crash; Close owns
+		// the cleanup for requested exits.
+		return
+	}
+	err := exit.err
 	if err == nil {
 		err = errors.New("ACP agent process exited")
 	}
@@ -932,6 +942,7 @@ func (a *ACP) fail(err error) {
 	}
 	a.stdin = nil
 	cancel := a.cancel
+	proc := a.proc
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -946,6 +957,15 @@ func (a *ACP) fail(err error) {
 		if failedTurn.emit != nil {
 			failedTurn.emit(core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: sessionID, Done: true,
 				Execution: &core.ExecutionStatus{State: "error", Detail: err.Error()}})
+		}
+	}
+	// The agent may still be running behind a broken transport; the failed
+	// adapter owns exactly one bounded stop before its cleanup is complete.
+	// A stop failure here is shutdown diagnostics on top of the primary
+	// failure; it never re-enters failure handling.
+	if proc != nil {
+		if err := proc.Stop(context.Background()); err != nil && a.config.Stderr != nil {
+			_, _ = fmt.Fprintf(a.config.Stderr, "stop ACP agent process: %v\n", err)
 		}
 	}
 }
