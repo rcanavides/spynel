@@ -27,6 +27,13 @@ import (
 
 const LeaseBlockedProviderUnavailable = "provider_unavailable"
 
+// workflowWriterConcurrency temporarily serializes route-scanned workflow
+// execution because every agent shares one checkout and writes the same
+// durable workspace. C9-F replaces this gate with isolated per-task
+// workspaces; remove or replace it there. Notification and heartbeat turns
+// are ordinary agent turns and never pass through this gate.
+const workflowWriterConcurrency = 1
+
 type LeaseBlock struct {
 	Reason string    `json:"reason"`
 	Since  time.Time `json:"since"`
@@ -89,6 +96,9 @@ type Manager struct {
 	capacityActive              int
 	capacityLimit               int
 	capacityChanged             chan struct{}
+	writerMu                    sync.Mutex
+	writerActive                int
+	writerChanged               chan struct{}
 	Outbox                      *Outbox
 	ownerID                     string
 	scanNow                     chan struct{}
@@ -230,6 +240,7 @@ func New(cfg config.Config, target harness.ExecutionTarget, hooks extensions.Run
 		ownerID:                fmt.Sprintf("%d-%d-%s", os.Getpid(), time.Now().UTC().UnixNano(), randomSuffix()),
 		scanNow:                make(chan struct{}, 1),
 		capacityChanged:        make(chan struct{}, 1),
+		writerChanged:          make(chan struct{}, 1),
 		scanTimerChanged:       make(chan struct{}, 1),
 		heartbeatConfigChanged: make(chan struct{}, 1),
 		heartbeatManual:        make(chan heartbeatManualRequest),
@@ -454,6 +465,39 @@ func (m *Manager) releaseCapacity() {
 	}
 	m.capacityMu.Unlock()
 	m.signalCapacityChanged()
+}
+
+// acquireWorkflowWriter serializes route-scanned workflow execution at the
+// temporary single-writer bound. It mirrors acquireCapacity: a waiter parks on
+// writerChanged with its caller context, so cancellation exits without
+// acquiring. releaseWorkflowWriter is paired by the caller's defer.
+func (m *Manager) acquireWorkflowWriter(ctx context.Context) bool {
+	for {
+		m.writerMu.Lock()
+		if m.writerActive < workflowWriterConcurrency {
+			m.writerActive++
+			m.writerMu.Unlock()
+			return true
+		}
+		m.writerMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-m.writerChanged:
+		}
+	}
+}
+
+func (m *Manager) releaseWorkflowWriter() {
+	m.writerMu.Lock()
+	if m.writerActive > 0 {
+		m.writerActive--
+	}
+	m.writerMu.Unlock()
+	select {
+	case m.writerChanged <- struct{}{}:
+	default:
+	}
 }
 
 func (m *Manager) requestScan() {
@@ -831,6 +875,12 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			// waiting for the periodic recovery scan.
 			m.requestScan()
 		}()
+		// The writer gate is taken before capacity so a workflow parked on the
+		// shared-checkout writer slot never consumes a max_parallel slot.
+		if !m.acquireWorkflowWriter(ctx) {
+			return
+		}
+		defer m.releaseWorkflowWriter()
 		if !m.acquireCapacity(ctx) {
 			return
 		}

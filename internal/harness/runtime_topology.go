@@ -225,11 +225,47 @@ func (r *Runtime) Start(ctx context.Context) error {
 	r.mu.Unlock()
 	var primaryErr error
 	for _, p := range entries {
-		if err := p.supervisor.Start(lifetime); err != nil && p.supervisor == primary {
-			primaryErr = err
+		if err := p.supervisor.Start(lifetime); err != nil {
+			if p.supervisor == primary {
+				primaryErr = err
+				continue
+			}
+			// A non-primary provider that fails to start stays explicitly
+			// unavailable for later reconciliation; Runtime.Start continues
+			// so healthy providers remain usable. Report exactly one bounded
+			// diagnostic on that provider's already-configured stderr so a
+			// routed role is visibly broken instead of silently absent.
+			writeProviderStartDiagnostic(p, err)
 		}
 	}
 	return primaryErr
+}
+
+// providerStartDiagnosticLimit bounds the error text carried by one
+// non-primary provider-start diagnostic so a chatty adapter failure cannot
+// turn the configured stderr into an unbounded dump.
+const providerStartDiagnosticLimit = 1024
+
+// writeProviderStartDiagnostic reports exactly one bounded diagnostic for a
+// non-primary provider whose Start failed. The diagnostic includes the
+// provider instance identity and uses the provider's already-wired
+// HarnessConfig stderr; no separate logging subsystem, retry, or health
+// taxonomy is involved. The primary chat provider never takes this path: its
+// Start error is returned unchanged.
+func writeProviderStartDiagnostic(p *providerEntry, err error) {
+	stderr := p.supervisor.HarnessConfig().Stderr
+	if stderr == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(stderr, "provider %q failed to start and remains unavailable: %s\n", string(p.id), boundProviderStartText(err.Error()))
+}
+
+func boundProviderStartText(text string) string {
+	runes := []rune(text)
+	if len(runes) <= providerStartDiagnosticLimit {
+		return text
+	}
+	return string(runes[:providerStartDiagnosticLimit]) + "…"
 }
 
 // Close is the one whole-runtime shutdown path: it cancels the runtime-owned

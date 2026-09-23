@@ -6,6 +6,8 @@
 
 ## Local Contracts
 
+- `docs/roadmap.md` owns the concise completed/next roadmap and its forward rules; keep it short, dated by milestone or commit, and free of design specs.
+
 - Commands and configuration examples must match executable behavior and embedded defaults.
 - Keep public positioning aligned with the root product contract and `docs/vision.md`: Spynel is a classic non-AI orchestration program, external harnesses provide intelligence, and the single “agent” in the relationship slogan denotes the human-facing assistant interface. Adapt copy length to its surface without inventing product facts or treating conceptual scale as a resource guarantee.
 - Keep root-README image assets under `.github/resources/`; `docs/` owns documentation content rather than repository-presentation artwork.

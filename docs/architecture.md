@@ -26,7 +26,7 @@ Authenticated transport and loopback admission is the workspace authorization bo
 | `updater` | Installation-local npm/GitHub ownership, bounded checks, validated immutable standalone bundles and stable restart paths. |
 | `workspace` | Embedded editable configuration, prompts, and DOX templates plus private directory creation; built-in themes remain owned by `theme`. |
 
-`cmd/spynel` is composition only. A channel translates external traffic into `core.Message` and calls the application; it never knows which coding-agent protocol is active. The application and orchestrator depend only on `harness.Harness`.
+`cmd/spynel` is composition only. A channel translates external traffic into `core.Message` and calls the application; it never knows which coding-agent protocol is active. The application depends on the `harness.Harness` service interface, while the orchestrator resolves provider-neutral `harness.ExecutionTarget` work through role routing and handles typed provider errors (`ErrProviderUnavailable`, `ErrProviderFenced`, `ErrProviderAbsent`) with durable instance ownership; neither knows a concrete adapter protocol.
 
 Live configuration uses a serialized save-and-reload boundary. The store validates a complete candidate, atomically replaces canonical YAML, reloads that file into the shared process snapshot before returning, and publishes the refreshed value. Runtime consumers read that snapshot for subsequent operations; only owners with derived cached state receive small direct refresh hooks. Channel supervision reconciles published snapshots without replacing the running process, and active communication or orchestrated work may finish under its already-admitted state.
 
@@ -84,7 +84,7 @@ The plain CLI is another adapter over this control plane. `send` uses an indepen
 
 ## Harness lifecycle
 
-The harness supervisor owns at most one running harness and exposes readiness without preventing the rest of Spynel from starting. A missing selection or executable can be recorded for setup when no harness is running. Reconfiguration constructs a replacement before swapping a working harness and refuses to switch while the current harness has active work.
+The unified `harness.Runtime` owns the lifecycle of every provider instance for the chat, developer, reviewer, notification, and heartbeat roles. A normalized `RuntimeSpec` declares one `Supervisor` per unique provider instance plus role mappings, with the chat role defining the primary and unspecified roles falling back to it. Start failures are isolated per provider: the primary chat error is returned unchanged, while a failed non-primary provider stays explicitly unavailable, writes exactly one bounded diagnostic to its already-configured stderr naming its provider identity, and remains retryable by later reconciliation, so healthy providers keep serving. Reconciliation prepares structural changes transactionally through prepare/commit/abort, keeps unchanged providers running, and publishes role mappings atomically; it refuses to retire a provider while owned executions, logical turns, or active bindings remain. Supervisors broadcast readiness so observers recheck current state without a second availability state machine.
 
 Codex starts one `codex app-server --stdio` process, performs the initialize handshake, and maps stable Spynel session keys to persisted thread IDs. An idle message uses `turn/start`; a message arriving during an active turn uses `turn/steer`; `/stop` uses `turn/interrupt` for that conversation only. `model/list` supplies its model catalog.
 

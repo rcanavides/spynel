@@ -13,6 +13,7 @@ import (
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
 
@@ -119,6 +120,442 @@ func TestLiveParallelLimitRaisesPromptlyAndLowersWithoutCancelling(t *testing.T)
 		t.Fatal("waiting work was not admitted after active work drained below the new bound")
 	}
 	manager.releaseCapacity()
+}
+
+// H1: the temporary single-writer gate serializes route-scanned workflow
+// dispatches. While one workflow turn holds the writer slot inside its
+// provider turn, a second claimed workflow cannot start its own provider
+// turn; both complete once the first releases.
+func TestWorkflowWriterGateSerializesConcurrentRouteDispatches(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(cfg, "tasks", "first writer task", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(cfg, "tasks", "second writer task", ""); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeRecipient()
+	unblock := make(chan struct{})
+	fake.beforeEmit = func() { <-unblock }
+	manager := New(cfg, fake, extensions.Runner{})
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	fake.mu.Lock()
+	calls := fake.calls
+	fake.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("in-flight provider turns = %d, want exactly one while it holds the writer gate", calls)
+	}
+	close(unblock)
+	manager.Wait()
+	if fake.calls != 2 {
+		t.Fatalf("dispatch calls = %d, want 2 after both serialized turns completed", fake.calls)
+	}
+}
+
+// H2: a workflow parked on the writer gate must not consume a max_parallel
+// capacity slot. With the writer slot held and max_parallel reduced to one,
+// the parked dispatch leaves the single capacity slot free for other work.
+func TestWorkflowWriterWaitHoldsNoCapacitySlot(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Orchestrator.MaxParallel = 1
+	if _, err := Create(cfg, "tasks", "writer capacity task", ""); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeRecipient()
+	manager := New(cfg, fake, extensions.Runner{})
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	leases, err := manager.loadLeases()
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("leases = %#v, %v", leases, err)
+	}
+	if !manager.acquireWorkflowWriter(context.Background()) {
+		t.Fatal("writer ownership was unavailable")
+	}
+	manager.dispatch(context.Background(), workflowRoutes()[0], leases[0], true)
+	time.Sleep(50 * time.Millisecond)
+	capacityCtx, cancelCapacity := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelCapacity()
+	if !manager.acquireCapacity(capacityCtx) {
+		t.Fatal("workflow parked on the writer gate consumed a capacity slot")
+	}
+	fake.mu.Lock()
+	calls := fake.calls
+	fake.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("dispatch calls = %d, want 1 while the gated turn waits for writer ownership", calls)
+	}
+	manager.releaseCapacity()
+	manager.releaseWorkflowWriter()
+	manager.Wait()
+	if fake.calls != 2 {
+		t.Fatalf("dispatch calls = %d, want 2 after the gated turn completed", fake.calls)
+	}
+}
+
+// H3: ownership pairing. A waiter cancelled while parked on the writer gate
+// returns false without acquiring ownership, and every released ownership
+// admits exactly one parked waiter.
+func TestWorkflowWriterCancelWhileWaitingKeepsOwnershipPairing(t *testing.T) {
+	cfg := config.Default()
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !manager.acquireWorkflowWriter(ctx) {
+		t.Fatal("initial writer ownership was unavailable")
+	}
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	waiterDone := make(chan bool, 1)
+	go func() { waiterDone <- manager.acquireWorkflowWriter(waitCtx) }()
+	select {
+	case acquired := <-waiterDone:
+		if acquired {
+			t.Fatal("waiter admitted while the single writer slot was held")
+		}
+		t.Fatal("waiter returned before cancellation")
+	case <-time.After(25 * time.Millisecond):
+	}
+	cancelWait()
+	select {
+	case acquired := <-waiterDone:
+		if acquired {
+			t.Fatal("cancelled waiter reported acquiring writer ownership")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled waiter never returned")
+	}
+	manager.releaseWorkflowWriter()
+	if !manager.acquireWorkflowWriter(ctx) {
+		t.Fatal("release did not return writer ownership")
+	}
+	parked := make(chan struct{})
+	go func() {
+		if manager.acquireWorkflowWriter(ctx) {
+			close(parked)
+		}
+	}()
+	select {
+	case <-parked:
+		t.Fatal("cancelled waiter leaked an ownership slot")
+	case <-time.After(25 * time.Millisecond):
+	}
+	manager.releaseWorkflowWriter()
+	select {
+	case <-parked:
+	case <-time.After(time.Second):
+		t.Fatal("release did not admit the parked waiter")
+	}
+	manager.releaseWorkflowWriter()
+}
+
+// ordinaryTurnGateHarness records one ordinary agent turn with explicit
+// admission and release channels so a test observes the exact in-flight
+// window without timing assumptions.
+type ordinaryTurnGateHarness struct {
+	mu       sync.Mutex
+	prompts  []string
+	admitted chan struct{}
+	release  chan struct{}
+}
+
+func (h *ordinaryTurnGateHarness) Start(context.Context) error { return nil }
+func (h *ordinaryTurnGateHarness) Close() error                { return nil }
+func (h *ordinaryTurnGateHarness) ResetSession(string) error   { return nil }
+func (h *ordinaryTurnGateHarness) ThreadID(string) string      { return "thread-ordinary" }
+func (h *ordinaryTurnGateHarness) IsActive(string) bool        { return false }
+func (h *ordinaryTurnGateHarness) Interrupt(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (h *ordinaryTurnGateHarness) Send(_ context.Context, _ string, prompt string, emit core.Emit) (string, bool, error) {
+	h.mu.Lock()
+	h.prompts = append(h.prompts, prompt)
+	h.mu.Unlock()
+	close(h.admitted)
+	<-h.release
+	emit(core.Event{Kind: core.EventFinal, Text: "ordinary turn complete", ThreadID: "thread-ordinary", Done: true})
+	return "thread-ordinary", false, nil
+}
+
+// H4: ordinary notification and heartbeat turns never pass through the
+// workflow writer gate and never join workflow inflight accounting. While
+// the single writer slot is held by a route-scanned workflow writer, both
+// ordinary turns still admit and run to completion.
+func TestOrdinaryTurnsProceedWhileWorkflowWriterHeld(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(cfg.StatePath("tasks", "done"), "task.md")
+	document := Document{FrontMatter: map[string]any{
+		"id": "task-h4", "title": "Publish report", "status": "done", "attempt": 1,
+		"notify": map[string]any{"enabled": true, "origin": "tui/local", "on": []any{"done"}},
+	}, Body: "# Publish report\n\n## Progress\n\n- 2026-08-09T11:00:00Z — Report published.\n"}
+	if err := WriteDocument(path, document); err != nil {
+		t.Fatal(err)
+	}
+	notificationTarget := &ordinaryTurnGateHarness{admitted: make(chan struct{}), release: make(chan struct{})}
+	heartbeatTarget := &ordinaryTurnGateHarness{admitted: make(chan struct{}), release: make(chan struct{})}
+	fallback := newFakeRecipient()
+	manager := New(cfg, fallback, extensions.Runner{})
+	manager.HarnessRouter = harness.NewStaticRoleRouter(fallback, map[harness.Role]harness.Harness{
+		harness.RoleNotification: notificationTarget,
+		harness.RoleHeartbeat:    heartbeatTarget,
+	})
+	manager.SetPrimaryOwned(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !manager.acquireWorkflowWriter(ctx) {
+		t.Fatal("writer ownership was unavailable")
+	}
+	defer manager.releaseWorkflowWriter()
+
+	manager.startTaskNotificationAgent(ctx, Lease{ID: "lease-h4-notify", Route: "tasks", Phase: phaseTaskImplementation, ClaimAttempt: 1}, "done", path)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		manager.runSemanticHeartbeatOnce(ctx)
+	}()
+
+	select {
+	case <-notificationTarget.admitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("notification ordinary turn did not proceed while the workflow writer gate was held")
+	}
+	select {
+	case <-heartbeatTarget.admitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat ordinary turn did not proceed while the workflow writer gate was held")
+	}
+
+	// Neither ordinary turn consumed the writer slot: the test still owns
+	// the only admission.
+	manager.writerMu.Lock()
+	writerActive := manager.writerActive
+	manager.writerMu.Unlock()
+	if writerActive != 1 {
+		t.Fatalf("ordinary turns changed workflow writer ownership: active = %d, want 1 held by this test", writerActive)
+	}
+	// Neither ordinary turn participates in workflow inflight accounting.
+	manager.mu.Lock()
+	inflight := len(manager.inflight)
+	manager.mu.Unlock()
+	if inflight != 0 {
+		t.Fatalf("ordinary turns entered workflow inflight accounting: %d entries", inflight)
+	}
+	_, active, err := manager.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("workflow inflight status = %d while only ordinary turns run", active)
+	}
+
+	close(notificationTarget.release)
+	close(heartbeatTarget.release)
+	manager.Wait()
+	select {
+	case <-heartbeatDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat ordinary turn did not finish after its provider release")
+	}
+	notificationTarget.mu.Lock()
+	notificationCalls := len(notificationTarget.prompts)
+	notificationTarget.mu.Unlock()
+	if notificationCalls != 1 {
+		t.Fatalf("notification provider turns = %d, want exactly 1", notificationCalls)
+	}
+	heartbeatTarget.mu.Lock()
+	heartbeatCalls := len(heartbeatTarget.prompts)
+	heartbeatTarget.mu.Unlock()
+	if heartbeatCalls != 1 {
+		t.Fatalf("heartbeat provider turns = %d, want exactly 1", heartbeatCalls)
+	}
+	// The writer slot is still fully held by this test alone: ordinary turns
+	// never released ownership they did not acquire.
+	probeCtx, cancelProbe := context.WithCancel(context.Background())
+	probeDone := make(chan bool, 1)
+	go func() { probeDone <- manager.acquireWorkflowWriter(probeCtx) }()
+	select {
+	case acquired := <-probeDone:
+		if acquired {
+			t.Fatal("ordinary turns released the workflow writer slot")
+		}
+		t.Fatal("writer probe returned before cancellation")
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancelProbe()
+	select {
+	case acquired := <-probeDone:
+		if acquired {
+			t.Fatal("cancelled writer probe acquired ownership")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled writer probe never returned")
+	}
+}
+
+// entryTrackerHarness records every workflow provider-turn entry and parks
+// each entered turn on one shared release channel.
+type entryTrackerHarness struct {
+	mu      sync.Mutex
+	entered []string
+	entries chan string
+	unblock chan struct{}
+}
+
+func (h *entryTrackerHarness) Start(context.Context) error { return nil }
+func (h *entryTrackerHarness) Close() error                { return nil }
+func (h *entryTrackerHarness) ResetSession(string) error   { return nil }
+func (h *entryTrackerHarness) ThreadID(key string) string  { return "thread-" + key }
+func (h *entryTrackerHarness) IsActive(string) bool        { return false }
+func (h *entryTrackerHarness) Interrupt(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (h *entryTrackerHarness) Send(_ context.Context, key string, _ string, emit core.Emit) (string, bool, error) {
+	h.mu.Lock()
+	h.entered = append(h.entered, key)
+	h.mu.Unlock()
+	h.entries <- key
+	<-h.unblock
+	emit(core.Event{Kind: core.EventFinal, Text: "done", ThreadID: key, Done: true})
+	return key, false, nil
+}
+
+// H6: the temporary writer gate covers the durable recovery path as well as
+// fresh route-scanned claims. One resumed interrupted claim and one fresh
+// scan claim both reach the shared writer serialization path; exactly one
+// reaches provider execution while the first holds the slot, and the other
+// proceeds after release.
+func TestWorkflowWriterGateSerializesRecoveryWithFreshClaim(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &entryTrackerHarness{entries: make(chan string, 2), unblock: make(chan struct{})}
+	manager := New(cfg, target, extensions.Runner{})
+
+	// Recovery workflow: an interrupted claim persisted as a claiming lease
+	// beside its already-claimed working document, exactly as a crashed
+	// process would leave it for resumeInterruptedClaims.
+	recoveryID := "tasks-h6-recovery"
+	recoveryPath := filepath.Join(cfg.StatePath("tasks", "working"), "recovery-task.md")
+	recoveryDocument := Document{FrontMatter: map[string]any{
+		"id": recoveryID, "title": "Writer recovery task", "status": "working", "attempt": 2,
+	}, Body: "# Writer recovery task\n\n## Progress\n\n- 2026-08-09T11:00:00Z — Claimed before the interruption.\n"}
+	if err := WriteDocument(recoveryPath, recoveryDocument); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	recoveryKey := leaseID("tasks:"+phaseTaskImplementation, recoveryID)
+	recoverySession := phaseSessionKey("tasks", recoveryID, phaseTaskImplementation, 2)
+	if err := manager.saveLease(Lease{
+		ID: recoveryKey, ClaimID: recoveryKey, DocumentType: "task", Route: "tasks",
+		File: recoveryPath, SessionKey: recoverySession, State: "claiming",
+		Phase: phaseTaskImplementation, ClaimAttempt: 2, StartedAt: now, HeartbeatAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh workflow: an ordinary unclaimed todo document.
+	freshPath, err := Create(cfg, "tasks", "writer fresh task", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshDocument, err := ReadDocument(freshPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshID := documentID(freshDocument)
+	freshSession := phaseSessionKey("tasks", freshID, phaseTaskImplementation, 1)
+
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first := awaitEntry(t, target.entries, "no workflow execution entered its provider turn")
+	manager.writerMu.Lock()
+	writerActive := manager.writerActive
+	manager.writerMu.Unlock()
+	if writerActive != 1 {
+		t.Fatalf("first gated execution did not hold the single writer slot: active = %d", writerActive)
+	}
+	// Exactly one reaches execution while the first is gated.
+	select {
+	case second := <-target.entries:
+		t.Fatalf("workflow execution %q reached the provider while the first execution held the writer gate", second)
+	case <-time.After(100 * time.Millisecond):
+	}
+	target.mu.Lock()
+	entered := len(target.entered)
+	target.mu.Unlock()
+	if entered != 1 {
+		t.Fatalf("provider turns entered = %d, want exactly one while the writer gate is held", entered)
+	}
+	if first != recoverySession && first != freshSession {
+		t.Fatalf("unexpected first execution session %q", first)
+	}
+	// After release the other proceeds.
+	close(target.unblock)
+	second := awaitEntry(t, target.entries, "the waiting workflow execution did not proceed after the writer slot was released")
+	if second == first {
+		t.Fatalf("the same execution %q re-entered the provider instead of the waiting workflow proceeding", second)
+	}
+	manager.Wait()
+	target.mu.Lock()
+	keys := append([]string(nil), target.entered...)
+	target.mu.Unlock()
+	if len(keys) != 2 {
+		t.Fatalf("provider turns entered = %d, want the recovery and fresh executions", len(keys))
+	}
+	got := map[string]bool{keys[0]: true, keys[1]: true}
+	if !got[recoverySession] || !got[freshSession] {
+		t.Fatalf("writer path sessions = %v, want recovery %q and fresh %q", keys, recoverySession, freshSession)
+	}
+	recoveryLease, err := manager.loadLease(recoveryKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recoveryLease.RecoveryCount < 1 {
+		t.Fatalf("recovery execution did not run the durable recovery path: lease = %#v", recoveryLease)
+	}
+}
+
+func awaitEntry(t *testing.T, entries <-chan string, message string) string {
+	t.Helper()
+	select {
+	case key := <-entries:
+		return key
+	case <-time.After(2 * time.Second):
+		t.Fatal(message)
+		return ""
+	}
 }
 
 func TestLiveScanIntervalResetsRunningSchedulerFromAcceptedChange(t *testing.T) {
