@@ -378,9 +378,18 @@ func (p *Pi) Close() error {
 	if cancel != nil {
 		cancel()
 	}
+	// Every session owns exactly one independent provider process, so the
+	// bounded per-process stops fan out concurrently and Close waits for all
+	// of them before returning.
+	var stops sync.WaitGroup
 	for _, process := range processes {
-		process.close()
+		stops.Add(1)
+		go func() {
+			defer stops.Done()
+			process.close()
+		}()
 	}
+	stops.Wait()
 	return nil
 }
 

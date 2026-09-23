@@ -833,14 +833,22 @@ func (c *Claude) Close() error {
 		cancel()
 	}
 	// Every active turn is stopped explicitly; process termination is owned
-	// by providerProcess, not by context cancellation. A failed stop is
-	// logged as shutdown diagnostics and never changes turn semantics.
+	// by providerProcess, not by context cancellation. Each active turn owns
+	// an independent provider process, so the bounded stops fan out
+	// concurrently and Close waits for every one. A failed stop is logged as
+	// shutdown diagnostics and never changes turn semantics.
+	var stops sync.WaitGroup
 	for _, turn := range turns {
-		if stopErr := turn.proc.Stop(context.Background()); stopErr != nil {
-			c.logStopFailure(c.config.Stderr, stopErr)
-		}
-		turn.cancel()
+		stops.Add(1)
+		go func() {
+			defer stops.Done()
+			if stopErr := turn.proc.Stop(context.Background()); stopErr != nil {
+				c.logStopFailure(c.config.Stderr, stopErr)
+			}
+			turn.cancel()
+		}()
 	}
+	stops.Wait()
 	return nil
 }
 

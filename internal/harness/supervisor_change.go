@@ -15,6 +15,12 @@ var (
 	// ErrProviderUnavailable identifies failure to select a running provider,
 	// not an error returned by an already-admitted provider execution.
 	ErrProviderUnavailable = errors.New("harness unavailable")
+	// ErrRetirementIncomplete means the desired provider topology was already
+	// published and is active, but cleanup of the removed providers or
+	// previous harnesses it displaced did not finish cleanly. The published
+	// topology must stay; callers must not roll it back or restore the old
+	// one, only surface the incomplete-cleanup diagnostics.
+	ErrRetirementIncomplete = errors.New("provider retirement incomplete")
 )
 
 // PreparedChange owns a structural admission fence until Commit or Abort.

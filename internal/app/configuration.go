@@ -1226,7 +1226,14 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	topologyChanged := primaryHarnessChanged || roleHarnessChanged
 	if topologyChanged {
 		if err := s.reconfigureHarness(next); err != nil {
-			return nil, err
+			if !errors.Is(err, harness.ErrRetirementIncomplete) {
+				return nil, err
+			}
+			// The requested topology is published and active; only old-resource
+			// cleanup was incomplete. Persistence must proceed on the live
+			// topology instead of skipping persistence and rolling back to a
+			// configuration the runtime no longer runs.
+			s.Runtime.LogEvent("error", "harness", "retirement_failed", "Provider retirement incomplete after publishing the requested harness topology: "+err.Error())
 		}
 	}
 	if unchanged && !startupRequested {
@@ -1253,6 +1260,9 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		var primaryRollback error
 		if topologyChanged {
 			primaryRollback = s.reconfigureHarness(previous)
+			if errors.Is(primaryRollback, harness.ErrRetirementIncomplete) {
+				s.Runtime.LogEvent("error", "harness", "retirement_failed", "Provider retirement incomplete while restoring the previous harness topology: "+primaryRollback.Error())
+			}
 		}
 
 		s.Runtime.LogEvent("error", "config", "persist_failed", "Configuration persistence failed")

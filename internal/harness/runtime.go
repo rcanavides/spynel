@@ -31,9 +31,24 @@ type Runtime struct {
 	closed     bool
 	lifecycle  chan struct{}
 	ctx        context.Context
-	changed    chan struct{}
-	ready      chan struct{}
-	version    uint64
+	// shutdown is the runtime-owned lifetime. Close cancels it before any
+	// lifecycle wait so in-flight Start/Reconcile provider work whose context
+	// was joined with it unblocks deterministically instead of holding the
+	// shutdown orchestration forever. It is internal; no caller configures it.
+	shutdown context.Context
+	// cancelLife cancels shutdown; idempotent, so Close may fire it on every
+	// caller while exactly one orchestration performs the actual shutdown.
+	cancelLife context.CancelFunc
+	// lifetimeCancel releases the latest joined lifetime stored as ctx. The
+	// join registrations themselves release when shutdown cancels, so an
+	// earlier superseded lifetime never leaks a goroutine.
+	lifetimeCancel context.CancelFunc
+	// closeErr stores the one shutdown orchestration's result so every
+	// concurrent or repeated Close caller observes the same outcome.
+	closeErr error
+	changed  chan struct{}
+	ready    chan struct{}
+	version  uint64
 }
 
 // providerRoute retains the concrete owner behind one role mapping: the
@@ -118,4 +133,32 @@ func (r *Runtime) ConfigureUnavailable(cfg HarnessConfig, cause error) error {
 		return cause
 	}
 	return r.Reconfigure(cfg)
+}
+
+// joinShutdown couples a caller context with the runtime-owned shutdown
+// lifetime: work started under the joined context unblocks when either side
+// cancels. The returned cleanup releases the AfterFunc registration; callers
+// that store the joined context as a long-lived lifetime may defer cleanup
+// only while nothing depends on the context outliving their call.
+func (r *Runtime) joinShutdown(ctx context.Context) (context.Context, context.CancelFunc) {
+	joined, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(r.shutdown, cancel)
+	return joined, func() {
+		stop()
+		cancel()
+	}
+}
+
+// releaseLifetime cancels the latest joined lifetime stored as ctx and drops
+// the stored cancel. It runs after cancelLife in Close: shutdown propagation
+// already cancelled the same context through its AfterFunc, so this is
+// deterministic registration cleanup, not a second state change.
+func (r *Runtime) releaseLifetime() {
+	r.mu.Lock()
+	cancel := r.lifetimeCancel
+	r.lifetimeCancel = nil
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }

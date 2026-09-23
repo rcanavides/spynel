@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // ProviderID is the normalized provider instance identity from the topology
@@ -27,6 +28,47 @@ type providerEntry struct {
 	operations int
 	fenced     bool // structural work or retirement; protected by Runtime.mu
 	stop       chan struct{}
+	// watchDone closes when this entry's readiness watcher has exited. Every
+	// owner that closes stop must join watchDone outside Runtime.mu before
+	// considering the entry retired.
+	watchDone chan struct{}
+}
+
+// closeItem pairs one independent close target with the complete error
+// attribution prefix used when wrapping its failures, e.g.
+// `close provider "x"`.
+type closeItem struct {
+	label string
+	close func() error
+}
+
+// closeConcurrently closes every item in its own goroutine, waits for all of
+// them, and aggregates results in deterministic input order rather than
+// goroutine completion order. Callers supply sorted input for stable error
+// ordering. A panicking close callback is converted into a labeled error so
+// one broken target can never abort the remaining shutdown.
+func closeConcurrently(items []closeItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	errs := make([]error, len(items))
+	var wg sync.WaitGroup
+	for index := range items {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					errs[index] = fmt.Errorf("%s: panic during close: %v", items[index].label, recovered)
+				}
+			}()
+			if err := items[index].close(); err != nil {
+				errs[index] = fmt.Errorf("%s: %w", items[index].label, err)
+			}
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 func normalizeSpec(spec RuntimeSpec) (RuntimeSpec, error) {
@@ -85,8 +127,9 @@ func NewRuntimeSpec(registry *Registry, spec RuntimeSpec) (*Runtime, error) {
 		return nil, err
 	}
 	r := &Runtime{registry: registry, providers: make(map[ProviderID]*providerEntry), roles: make(map[Role]providerRoute), targets: make(map[Role]*runtimeTarget), bindings: make(map[string]*binding), changed: make(chan struct{}), ready: make(chan struct{}, 1)}
+	r.shutdown, r.cancelLife = context.WithCancel(context.Background())
 	for id, cfg := range spec.Providers {
-		r.providers[id] = &providerEntry{id: id, supervisor: NewSupervisor(registry, cfg), stop: make(chan struct{})}
+		r.providers[id] = &providerEntry{id: id, supervisor: NewSupervisor(registry, cfg), stop: make(chan struct{}), watchDone: make(chan struct{})}
 	}
 	r.publishRolesLocked(spec.Roles)
 	for _, p := range r.providers {
@@ -113,6 +156,7 @@ func (r *Runtime) notifyLocked() {
 func (r *Runtime) watch(p *providerEntry) {
 	_, changed := p.supervisor.Readiness()
 	go func() {
+		defer close(p.watchDone)
 		for {
 			select {
 			case <-p.stop:
@@ -157,12 +201,22 @@ func (r *Runtime) end() {
 	r.mu.Unlock()
 }
 func (r *Runtime) Start(ctx context.Context) error {
-	if err := r.begin(ctx); err != nil {
+	// Provider lifetime work runs under the caller context joined with the
+	// runtime-owned shutdown lifetime, so closing the runtime unblocks an
+	// in-flight Start as reliably as the caller cancelling its context. The
+	// joined lifetime is stored as r.ctx: later Reconcile additions and
+	// candidates derive from it, so it must outlive this call. A superseded
+	// lifetime is never cancelled here because running supervisors may still
+	// derive from it; each stored AfterFunc registration self-releases when
+	// shutdown cancels, so repeated Starts cannot leak goroutines.
+	lifetime, cancelLifetime := r.joinShutdown(ctx)
+	if err := r.begin(lifetime); err != nil {
+		cancelLifetime()
 		return err
 	}
 	defer r.end()
 	r.mu.Lock()
-	r.ctx = ctx
+	r.ctx, r.lifetimeCancel = lifetime, cancelLifetime
 	primary := r.supervisor
 	entries := make([]*providerEntry, 0, len(r.providers))
 	for _, p := range r.providers {
@@ -171,52 +225,88 @@ func (r *Runtime) Start(ctx context.Context) error {
 	r.mu.Unlock()
 	var primaryErr error
 	for _, p := range entries {
-		if err := p.supervisor.Start(ctx); err != nil && p.supervisor == primary {
+		if err := p.supervisor.Start(lifetime); err != nil && p.supervisor == primary {
 			primaryErr = err
 		}
 	}
 	return primaryErr
 }
+
+// Close is the one whole-runtime shutdown path: it cancels the runtime-owned
+// lifetime first so an in-flight Start or Reconcile whose provider work waits
+// on its joined context unblocks instead of holding the shutdown forever,
+// then obtains the lifecycle reservation and fences admissions. Exactly one
+// caller orchestrates; every concurrent or repeated caller returns the stored
+// orchestration result. No provider I/O runs under Runtime.mu, watchers are
+// joined before return, and independent provider supervisors close
+// concurrently so total latency approximates the slowest close, not the sum.
 func (r *Runtime) Close() error {
-	// Wait on a reservation, never while holding the runtime mutex.
+	r.cancelLife()
+	r.releaseLifetime()
 	for {
 		r.mu.Lock()
 		if r.lifecycle != nil {
+			// A lifecycle reservation is still held (Start, Reconcile, or the
+			// one Close orchestration); wait outside the mutex.
 			done := r.lifecycle
 			r.mu.Unlock()
 			<-done
 			continue
 		}
 		if r.closed {
+			// The shutdown orchestration already finished; every later or
+			// concurrent caller shares its stored result.
+			err := r.closeErr
 			r.mu.Unlock()
-			return nil
+			return err
 		}
 		r.closed = true
 		r.lifecycle = make(chan struct{})
 		clear(r.bindings)
 		entries := make([]*providerEntry, 0, len(r.providers))
 		for _, p := range r.providers {
-			close(p.stop)
 			entries = append(entries, p)
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].id < entries[j].id })
+		for _, p := range entries {
+			close(p.stop)
 		}
 		r.notifyLocked()
 		r.mu.Unlock()
-		var errs []error
+		// No Runtime-owned watcher may survive Close; joins happen outside
+		// r.mu because the watcher takes it to forward notifications.
 		for _, p := range entries {
-			errs = append(errs, p.supervisor.Close())
+			<-p.watchDone
 		}
+		items := make([]closeItem, 0, len(entries))
+		for _, p := range entries {
+			supervisor := p.supervisor
+			items = append(items, closeItem{label: fmt.Sprintf("close provider %q", p.id), close: supervisor.Close})
+		}
+		err := closeConcurrently(items)
+		r.mu.Lock()
+		r.closeErr = err
+		r.mu.Unlock()
 		r.end()
-		return errors.Join(errs...)
+		return err
 	}
 }
 
 // Reconcile prepares affected providers before atomically publishing the role
-// table. Unchanged supervisors retain their process and session state.
-func (r *Runtime) Reconcile(ctx context.Context, spec RuntimeSpec) error {
-	spec, err := normalizeSpec(spec)
+// table. Unchanged supervisors retain their process and session state. The
+// caller context is joined with the runtime shutdown lifetime before lifecycle
+// admission so closing the runtime unblocks candidate startup, inflight
+// draining, and any pre-publication wait. Publication stays transactional:
+// cleanup failures before publication join the primary failure, while a
+// retirement failure after publication reports ErrRetirementIncomplete because
+// the published topology remains active and must never be rolled back.
+func (r *Runtime) Reconcile(ctx context.Context, spec RuntimeSpec) (err error) {
+	spec, err = normalizeSpec(spec)
 	if err != nil {
 		return err
 	}
+	ctx, cancelJoin := r.joinShutdown(ctx)
+	defer cancelJoin()
 	if err = r.begin(ctx); err != nil {
 		return err
 	}
@@ -260,11 +350,32 @@ func (r *Runtime) Reconcile(ctx context.Context, spec RuntimeSpec) error {
 	committed := false
 	defer func() {
 		if !committed {
-			for _, c := range changes {
-				_ = c.Abort()
+			// Pre-publication cleanup keeps the primary failure first and
+			// joins any cleanup errors after it; publication never happened,
+			// so nothing here is ErrRetirementIncomplete.
+			var cleanup []error
+			for _, name := range sortedProviderIDs(changes) {
+				id := ProviderID(name)
+				if c := changes[id]; c != nil {
+					if abortErr := c.Abort(); abortErr != nil {
+						cleanup = append(cleanup, fmt.Errorf("abort candidate of provider %q: %w", id, abortErr))
+					}
+				}
 			}
-			for _, p := range added {
-				_ = p.supervisor.Close()
+			for _, name := range sortedProviderIDs(added) {
+				id := ProviderID(name)
+				if p := added[id]; p != nil {
+					if closeErr := p.supervisor.Close(); closeErr != nil {
+						cleanup = append(cleanup, fmt.Errorf("close added provider %q: %w", id, closeErr))
+					}
+				}
+			}
+			if len(cleanup) > 0 {
+				if err != nil {
+					err = errors.Join(append([]error{err}, cleanup...)...)
+				} else {
+					err = errors.Join(cleanup...)
+				}
 			}
 		}
 		r.mu.Lock()
@@ -274,11 +385,7 @@ func (r *Runtime) Reconcile(ctx context.Context, spec RuntimeSpec) error {
 		r.notifyLocked()
 		r.mu.Unlock()
 	}()
-	ids := make([]string, 0, len(old))
-	for id := range old {
-		ids = append(ids, string(id))
-	}
-	sort.Strings(ids)
+	ids := sortedProviderIDs(old)
 	for _, name := range ids {
 		id := ProviderID(name)
 		p := old[id]
@@ -343,7 +450,7 @@ func (r *Runtime) Reconcile(ctx context.Context, spec RuntimeSpec) error {
 		if next[id] != nil {
 			continue
 		}
-		p := &providerEntry{id: id, supervisor: NewSupervisor(r.registry, cfg), stop: make(chan struct{})}
+		p := &providerEntry{id: id, supervisor: NewSupervisor(r.registry, cfg), stop: make(chan struct{}), watchDone: make(chan struct{})}
 		added[id] = p
 		next[id] = p
 		if lifetime != nil {
@@ -386,13 +493,16 @@ func (r *Runtime) Reconcile(ctx context.Context, spec RuntimeSpec) error {
 		}
 	}
 
-	if err := ctx.Err(); err != nil {
+	if err = ctx.Err(); err != nil {
 		return err
 	}
-	var retired []Harness
-	for _, c := range changes {
-		if previous := c.Commit(); previous != nil {
-			retired = append(retired, previous)
+	// Commit point: replacements publish in sorted provider order and hand
+	// each previous harness back for retirement outside locks.
+	retired := make(map[ProviderID]Harness)
+	for _, name := range sortedProviderIDs(changes) {
+		id := ProviderID(name)
+		if previous := changes[id].Commit(); previous != nil {
+			retired[id] = previous
 		}
 	}
 	r.mu.Lock()
@@ -404,16 +514,54 @@ func (r *Runtime) Reconcile(ctx context.Context, spec RuntimeSpec) error {
 	for _, p := range added {
 		r.watch(p)
 	}
-	for id, p := range old {
-		if next[id] == nil {
-			close(p.stop)
-			_ = p.supervisor.Close()
-		}
-	}
-	for _, h := range retired {
-		_ = h.Close()
+	if retireErr := r.retire(old, next, retired); retireErr != nil {
+		return errors.Join(ErrRetirementIncomplete, retireErr)
 	}
 	return nil
+}
+
+func sortedProviderIDs[V any](values map[ProviderID]V) []string {
+	ids := make([]string, 0, len(values))
+	for id := range values {
+		ids = append(ids, string(id))
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// retire shuts down ownership that stopped being part of the published
+// topology: removed providers' supervisors and the previous harnesses handed
+// back by structural commits. The targets are independent, so they close
+// concurrently; each has exactly one retirement owner here. A removed
+// provider's watcher is joined (outside Runtime.mu) after its stop is closed
+// and before its supervisor closes, so no watcher survives retirement.
+func (r *Runtime) retire(old, next map[ProviderID]*providerEntry, retired map[ProviderID]Harness) error {
+	ids := sortedProviderIDs(old)
+	items := make([]closeItem, 0, len(ids)+len(retired))
+	for _, name := range ids {
+		id := ProviderID(name)
+		if next[id] != nil {
+			continue
+		}
+		p := old[id]
+		items = append(items, closeItem{
+			label: fmt.Sprintf("retire provider %q", id),
+			close: func() error {
+				close(p.stop)
+				<-p.watchDone
+				return p.supervisor.Close()
+			},
+		})
+	}
+	for _, name := range sortedProviderIDs(retired) {
+		id := ProviderID(name)
+		previous := retired[id]
+		items = append(items, closeItem{
+			label: fmt.Sprintf("retire previous harness of provider %q", id),
+			close: func() error { return previous.Close() },
+		})
+	}
+	return closeConcurrently(items)
 }
 
 func (r *Runtime) providerFencedLocked(s supervisorOperations) bool {

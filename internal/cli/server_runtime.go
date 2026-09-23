@@ -259,7 +259,11 @@ func (term *primaryTerm) stopFor(targetID string) error {
 		term.service.SetPrimaryInstanceID("")
 		term.cancel()
 		_ = term.listener.Close()
-		_ = term.service.ClosePrimaryHarness()
+		if closeErr := term.service.ClosePrimaryHarness(); closeErr != nil {
+			// Durable logging is still open here; the deferred runtime-log close
+			// runs only after the whole stop sequence settles.
+			term.service.Runtime.LogEvent("error", "harness", "close_failed", "Harness close: "+closeErr.Error())
+		}
 		<-term.apiDone
 		<-term.channelsDone
 		<-term.orchestratorDone

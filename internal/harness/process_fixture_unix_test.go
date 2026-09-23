@@ -160,3 +160,29 @@ func mustExecutable() string {
 	}
 	return executable
 }
+
+// holdThroughBoundedStop models a provider whose turn never completes
+// naturally: it drains stdin in the background, records when the cooperative
+// stop stage arrives (stdin EOF), logs every catchable termination signal, and
+// only the uncatchable group kill can end it. Adapter close fanout tests use
+// this to prove concurrent bounded stops.
+func holdThroughBoundedStop() {
+	signals := make(chan os.Signal, 8)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(signals)
+	stdinDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		close(stdinDone)
+	}()
+	for {
+		select {
+		case <-stdinDone:
+			appendFixtureLog(map[string]any{"kind": "stop-entered"})
+			stdinDone = nil
+		case sig := <-signals:
+			appendFixtureLog(map[string]any{"kind": "signal", "text": sig.String()})
+		case <-time.After(time.Hour):
+		}
+	}
+}

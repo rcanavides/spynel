@@ -33,3 +33,21 @@ func runProcessLifecycleFixture(mode string) int {
 	_, _ = fmt.Fprintf(os.Stderr, "unknown windows process fixture mode %q\n", mode)
 	return 2
 }
+
+// holdThroughBoundedStop models a provider whose turn never completes
+// naturally: it drains stdin in the background, records when the cooperative
+// stop stage arrives (stdin EOF), and blocks until the direct-kill escalation
+// ends it. Windows has no catchable termination signals, so only the stop
+// entry is recorded.
+func holdThroughBoundedStop() {
+	stdinDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		close(stdinDone)
+	}()
+	<-stdinDone
+	appendFixtureLog(map[string]any{"kind": "stop-entered"})
+	for {
+		time.Sleep(time.Hour)
+	}
+}

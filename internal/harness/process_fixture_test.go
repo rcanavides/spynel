@@ -175,9 +175,9 @@ func runHarnessFixture(mode string) int {
 	switch mode {
 	case "codex-lifecycle", "codex-interrupt", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
 		return runCodexFixture(mode)
-	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero":
+	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero", "claude-hold":
 		return runClaudeFixture(mode)
-	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session", "pi-model-capabilities", "pi-off-default":
+	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session", "pi-model-capabilities", "pi-off-default", "pi-hold":
 		return runPiFixture(mode)
 	case "acp-lifecycle", "acp-interrupt", "acp-version-mismatch", "acp-session-error", "acp-late-final-chunk":
 		return runACPFixture(mode)
@@ -280,7 +280,14 @@ func runPiFixture(mode string) int {
 		case "prompt":
 			respond(message, map[string]any{})
 			messageStart()
-			if mode == "pi-steer" {
+			if mode == "pi-hold" {
+				// A turn that never completes naturally: the adapter's Close
+				// must stop this process through the bounded escalation, and
+				// the fixture records when the cooperative stop stage reaches
+				// it.
+				delta("working")
+				holdThroughBoundedStop()
+			} else if mode == "pi-steer" {
 				delta("first")
 			} else if mode == "pi-interrupt" {
 				delta("working")
@@ -592,6 +599,13 @@ func runClaudeFixture(mode string) int {
 		stream(session, "working")
 		for scanner.Scan() {
 		}
+		return 0
+	} else if mode == "claude-hold" {
+		// A turn that never completes naturally: the adapter's Close must
+		// stop this process through the bounded escalation, and the fixture
+		// records when the cooperative stop stage reaches it.
+		stream(session, "working")
+		holdThroughBoundedStop()
 		return 0
 	} else if mode == "claude-terminal-error" {
 		write(map[string]any{"type": "result", "subtype": "error_max_turns", "session_id": session, "is_error": true, "result": "maximum turns exceeded"})

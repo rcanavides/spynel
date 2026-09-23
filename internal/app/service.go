@@ -230,6 +230,12 @@ func (s *Service) Close() error {
 	s.stopRecoveryScanner()
 
 	harnessErr := s.ClosePrimaryHarness()
+	if harnessErr != nil {
+		// Provider stderr and shutdown diagnostics must still be writable to
+		// the durable runtime log while providers close, so log the harness
+		// failure before the log itself closes.
+		s.Runtime.LogEvent("error", "harness", "close_failed", "Harness close: "+harnessErr.Error())
+	}
 	s.stopAllChatActivity()
 	s.Runtime.Close()
 	return harnessErr
