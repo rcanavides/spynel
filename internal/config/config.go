@@ -304,12 +304,62 @@ type Startup struct {
 }
 
 type Orchestrator struct {
-	Enabled                      bool   `yaml:"enabled"`
-	IntervalSec                  int    `yaml:"interval_seconds"`
-	RetriggerUnrespondedMessages bool   `yaml:"retrigger_unresponded_messages"`
-	SemanticHeartbeatMinutes     int    `yaml:"semantic_heartbeat_minutes"`
-	TaskNotifications            string `yaml:"task_notifications"`
-	MaxParallel                  int    `yaml:"max_parallel"`
+	Enabled                      bool                `yaml:"enabled"`
+	IntervalSec                  int                 `yaml:"interval_seconds"`
+	RetriggerUnrespondedMessages bool                `yaml:"retrigger_unresponded_messages"`
+	SemanticHeartbeatMinutes     int                 `yaml:"semantic_heartbeat_minutes"`
+	TaskNotifications            string              `yaml:"task_notifications"`
+	MaxParallel                  int                 `yaml:"max_parallel"`
+	WorkspaceIsolation           string              `yaml:"workspace_isolation"`
+	Checks                       []OrchestratorCheck `yaml:"checks"`
+}
+
+// Workspace isolation modes. shared keeps the current single-checkout
+// execution; git-worktree gives every isolated implementation and review
+// launch its own detached locked worktree.
+const (
+	WorkspaceIsolationShared      = "shared"
+	WorkspaceIsolationGitWorktree = "git-worktree"
+)
+
+// OrchestratorCheck is one system-owned check executed by Spynel against an
+// exact captured result. The list is YAML-only: command surfaces cannot edit
+// it, and it applies live to new launches only.
+type OrchestratorCheck struct {
+	ID      string   `yaml:"id"`
+	Command string   `yaml:"command"`
+	Args    []string `yaml:"args,omitempty"`
+	Timeout string   `yaml:"timeout,omitempty"`
+}
+
+const (
+	// MaxOrchestratorChecks bounds the configured check set.
+	MaxOrchestratorChecks = 16
+	// CheckTimeoutDefault applies when a check omits its timeout.
+	CheckTimeoutDefault = "10m"
+	checkTimeoutMinimum = time.Second
+	checkTimeoutMaximum = 2 * time.Hour
+)
+
+var checkIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+// CheckTimeoutDuration parses one configured check timeout, applying the
+// documented default. Validation already rejected invalid values.
+func (c OrchestratorCheck) CheckTimeoutDuration() time.Duration {
+	if strings.TrimSpace(c.Timeout) == "" {
+		duration, _ := time.ParseDuration(CheckTimeoutDefault)
+		return duration
+	}
+	duration, _ := time.ParseDuration(strings.TrimSpace(c.Timeout))
+	return duration
+}
+
+// EffectiveWorkspaceIsolation normalizes the configured isolation mode.
+func (o Orchestrator) EffectiveWorkspaceIsolation() string {
+	if strings.ToLower(strings.TrimSpace(o.WorkspaceIsolation)) == WorkspaceIsolationGitWorktree {
+		return WorkspaceIsolationGitWorktree
+	}
+	return WorkspaceIsolationShared
 }
 
 type Extensions struct {
@@ -346,6 +396,7 @@ func Default() Config {
 		Startup: Startup{},
 		Orchestrator: Orchestrator{
 			Enabled: true, IntervalSec: 10, RetriggerUnrespondedMessages: true, SemanticHeartbeatMinutes: 15, TaskNotifications: TaskNotificationsDecide, MaxParallel: 4,
+			WorkspaceIsolation: WorkspaceIsolationShared,
 		},
 		Extensions: Extensions{Enabled: true, Directory: ".spynel/extensions", HookTimeout: "30s"},
 	}
@@ -423,6 +474,15 @@ func decode(data []byte, abs string) (Config, error) {
 	cfg.Harness.ReviewerAgentPrefix = strings.TrimSpace(cfg.Harness.ReviewerAgentPrefix)
 	cfg.Harness.HeartbeatAgentPrefix = strings.TrimSpace(cfg.Harness.HeartbeatAgentPrefix)
 	cfg.Harness.Reviews = normalizeTaskReviewMode(cfg.Harness.Reviews)
+	cfg.Orchestrator.WorkspaceIsolation = strings.ToLower(strings.TrimSpace(cfg.Orchestrator.WorkspaceIsolation))
+	if cfg.Orchestrator.WorkspaceIsolation == "" {
+		cfg.Orchestrator.WorkspaceIsolation = WorkspaceIsolationShared
+	}
+	for index := range cfg.Orchestrator.Checks {
+		cfg.Orchestrator.Checks[index].ID = strings.TrimSpace(cfg.Orchestrator.Checks[index].ID)
+		cfg.Orchestrator.Checks[index].Command = strings.TrimSpace(cfg.Orchestrator.Checks[index].Command)
+		cfg.Orchestrator.Checks[index].Timeout = strings.TrimSpace(cfg.Orchestrator.Checks[index].Timeout)
+	}
 	cfg.Speech.Language = strings.ToLower(strings.TrimSpace(cfg.Speech.Language))
 	cfg.Path = abs
 	cfg.Root = rootForConfigPath(abs)
@@ -599,6 +659,12 @@ func (c Config) Validate() error {
 	default:
 		problems = append(problems, "orchestrator.task_notifications must be off, decide, or always")
 	}
+	switch c.Orchestrator.WorkspaceIsolation {
+	case WorkspaceIsolationShared, WorkspaceIsolationGitWorktree:
+	default:
+		problems = append(problems, "orchestrator.workspace_isolation must be shared or git-worktree")
+	}
+	problems = appendOrchestratorCheckProblems(problems, c.Orchestrator.Checks)
 	if c.Channels.WhatsApp.Mode != "" && c.Channels.WhatsApp.Mode != "self-chat" && c.Channels.WhatsApp.Mode != "dedicated" {
 		problems = append(problems, "channels.whatsapp.mode must be self-chat or dedicated")
 	}
@@ -745,6 +811,51 @@ func appendProviderProfileProblems(problems []string, id string, profile Provide
 	case "", "read-only", "workspace-write", "danger-full-access":
 	default:
 		problems = append(problems, prefix+".sandbox must be empty (inherit), read-only, workspace-write, or danger-full-access")
+	}
+	return problems
+}
+
+// appendOrchestratorCheckProblems validates the configured system check set:
+// at most sixteen entries, unique ids matching the check id grammar, a
+// nonempty shell-free command, bounded one-line arguments, and a timeout
+// between one second and two hours. An empty list is valid.
+func appendOrchestratorCheckProblems(problems []string, checks []OrchestratorCheck) []string {
+	if len(checks) > MaxOrchestratorChecks {
+		problems = append(problems, fmt.Sprintf("orchestrator.checks supports at most %d entries", MaxOrchestratorChecks))
+	}
+	seen := make(map[string]bool, len(checks))
+	for index, check := range checks {
+		prefix := fmt.Sprintf("orchestrator.checks[%d]", index)
+		if !checkIDPattern.MatchString(check.ID) {
+			problems = append(problems, prefix+".id must match [a-z0-9][a-z0-9._-]{0,63}")
+		} else if seen[check.ID] {
+			problems = append(problems, prefix+".id "+check.ID+" is defined more than once")
+		}
+		seen[check.ID] = true
+		if check.Command == "" {
+			problems = append(problems, prefix+".command is required")
+		}
+		for _, argument := range check.Args {
+			if strings.ContainsRune(argument, '\x00') {
+				problems = append(problems, prefix+".args contains an invalid NUL byte")
+				break
+			}
+			if !utf8.ValidString(argument) {
+				problems = append(problems, prefix+".args contains invalid UTF-8")
+				break
+			}
+			if strings.ContainsAny(argument, "\r\n") {
+				problems = append(problems, prefix+".args cannot contain multiline arguments")
+				break
+			}
+		}
+		if strings.TrimSpace(check.Timeout) == "" {
+			continue
+		}
+		duration, err := time.ParseDuration(strings.TrimSpace(check.Timeout))
+		if err != nil || duration < checkTimeoutMinimum || duration > checkTimeoutMaximum {
+			problems = append(problems, prefix+".timeout must be between 1s and 2h")
+		}
 	}
 	return problems
 }

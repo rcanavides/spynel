@@ -13,6 +13,7 @@
 - Automatically managed speech models live in the operating-system user cache, not the workspace.
 - Create `.spynel/tasks/archive` as cold history without adding it to live workflows or ordinary workflow status sets.
 - Create `.spynel/jobs` as private inspection-only job history; it is not a workflow route or authority source.
+- Create `.spynel/runtime/facts`, `.spynel/runtime/launches`, `.spynel/runtime/locks`, and `.spynel/worktrees` as the durable evidence, launch-capture, lock, and isolated-execution directories owned by their runtime packages; they carry no workflow-route meaning.
 
 ## Child DOX Index
 

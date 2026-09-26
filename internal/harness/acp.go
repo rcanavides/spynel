@@ -478,6 +478,13 @@ func (a *ACP) ensureSession(ctx context.Context, key, model string) (acpSession,
 	}
 	cfg := a.config
 	cfg.Model = model
+	// A session-bound isolated workspace supplies the protocol CWD for the
+	// session and participates in the session policy, so a session created in
+	// one workspace is never resumed under another. The binding never moves
+	// ACP session persistence or the adapter process configuration.
+	if workspace, ok := SessionWorkspaceFor(key); ok && workspace.Dir != "" {
+		cfg.Cwd = workspace.Dir
+	}
 	session := a.sessions[key]
 	if session.Policy != acpSessionPolicy(cfg) {
 		session = acpSession{}

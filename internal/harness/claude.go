@@ -390,6 +390,13 @@ func (c *Claude) resumeSessionLocked(key string, cfg HarnessConfig) string {
 }
 
 func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previousSession string, cfg HarnessConfig, emit core.Emit) (string, bool, error) {
+	// A session-bound isolated workspace changes the execution directory of
+	// the per-turn process. Session persistence stays keyed by Spynel session
+	// maps and Claude's own session storage; the working directory is never
+	// part of the persisted session policy.
+	if workspace, ok := SessionWorkspaceFor(key); ok && workspace.Dir != "" {
+		cfg.Cwd = workspace.Dir
+	}
 	// The turn context is local cleanup only: it releases the admission
 	// context registration and never owns process termination. providerProcess
 	// Stop owns the process, so a turn cancel cannot kill anything by itself.

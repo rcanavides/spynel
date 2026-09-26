@@ -19,6 +19,7 @@
 - Default `orchestrator.retrigger_unresponded_messages` on for omitted and generated configurations, expose it with “Automatically processes stalled messages after restarts and disconnects.”, and apply it live so disabling prevents later scans without cancelling an admitted turn.
 
 - Orchestrator workflows belong to `internal/orchestrator`; configuration contains no route definitions, paths, transitions, prompt selection, or stale thresholds.
+- `orchestrator.workspace_isolation` accepts `shared` (default) or `git-worktree` and applies live to new claims only; a lineage keeps its recorded mode. `orchestrator.checks` is a YAML-only list (never a command setting) of at most sixteen system checks with unique ids matching `[a-z0-9][a-z0-9._-]{0,63}`, a required shell-free command with one-line UTF-8 arguments, and a timeout between 1s and 2h defaulting to 10m; the exact captured set is frozen per isolated launch and live changes affect only new launches.
 
 ## Child DOX Index
 

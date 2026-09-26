@@ -28,13 +28,14 @@ type cleanupResult struct {
 	RemovedJobArchives   int
 	RemovedJobBytes      int64
 	ArchivedTasks        int
+	RemovedWorkspaces    []string
 	RemovedObsoleteState int
 	Protected            int
 	Failed               int
 }
 
 func (r cleanupResult) String() string {
-	return fmt.Sprintf("Cleanup complete: %d conversations removed, %d job archives removed (%d bytes), %d terminal tasks archived, %d obsolete runtime items removed, %d live/protected items skipped, %d failures.", r.RemovedConversations, r.RemovedJobArchives, r.RemovedJobBytes, r.ArchivedTasks, r.RemovedObsoleteState, r.Protected, r.Failed)
+	return fmt.Sprintf("Cleanup complete: %d conversations removed, %d job archives removed (%d bytes), %d terminal tasks archived, %d isolated workspaces removed, %d obsolete runtime items removed, %d live/protected items skipped, %d failures.", r.RemovedConversations, r.RemovedJobArchives, r.RemovedJobBytes, r.ArchivedTasks, len(r.RemovedWorkspaces), r.RemovedObsoleteState, r.Protected, r.Failed)
 }
 
 func (s *Service) cleanupCommand(message core.Message, remainder string, emit core.Emit) error {
@@ -129,6 +130,17 @@ func (s *Service) runCleanup(days int, liveChannel, liveConversation string, now
 	result.ArchivedTasks = archived
 	result.Protected += taskProtected
 	result.Failed += failed
+	// Isolated execution workspaces follow the same retention boundary: live
+	// and preparing workspaces stay protected, integrated or not-applicable
+	// workspaces may go now, and failed, superseded, rejected, and reviewer
+	// workspaces retain for the configured window. Evidence and result refs
+	// are never deleted by cleanup.
+	workspaceRemoved, workspaceReported, workspaceErr := s.Orchestrator.CleanupIsolatedWorkspaces(context.Background(), now.Sub(cutoff))
+	result.RemovedWorkspaces = workspaceRemoved
+	result.Failed += len(workspaceReported)
+	if workspaceErr != nil {
+		result.Failed++
+	}
 	removedObsolete, obsoleteFailed := removeObsoleteNotificationState(s.Config.StatePath())
 	result.RemovedObsoleteState = removedObsolete
 	result.Failed += obsoleteFailed

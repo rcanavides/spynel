@@ -8,11 +8,14 @@ Short-lived orientation for contributors. It records where the work stands and t
 - C7.6b
 - C8.2 — 7b6a711
 - C8.3 — 0ae4175
-- C8.4a — current until committed
+- C8.4a — c9206bf
+
+## Current
+
+- C9-F
 
 ## Next
 
-- C9-F
 - C9+C10
 - C11
 - C12

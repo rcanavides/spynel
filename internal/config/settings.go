@@ -51,6 +51,7 @@ func Settings(cfg Config) []Setting {
 		{Key: "orchestrator.semantic_heartbeat_minutes", Section: "config", Description: "Fixed delay after each agent workflow audit completes; 0 disables it", Value: strconv.Itoa(cfg.Orchestrator.SemanticHeartbeatMinutes), Advanced: true},
 		{Key: "orchestrator.task_notifications", Section: "config", Description: "Live policy context for direct task notification agents", Value: cfg.Orchestrator.TaskNotifications, Choices: []string{TaskNotificationsOff, TaskNotificationsDecide, TaskNotificationsAlways}, Advanced: true},
 		{Key: "orchestrator.max_parallel", Section: "config", Description: "Live maximum concurrent Markdown jobs; lowering never cancels active work", Value: strconv.Itoa(cfg.Orchestrator.MaxParallel), Advanced: true},
+		{Key: "orchestrator.workspace_isolation", Section: "config", Description: "Live execution workspace mode for new task claims; shared keeps the single checkout and git-worktree gives isolated launches detached locked worktrees", Value: cfg.Orchestrator.EffectiveWorkspaceIsolation(), Choices: []string{WorkspaceIsolationShared, WorkspaceIsolationGitWorktree}, Advanced: true},
 		{Key: "extensions.enabled", Section: "config", Description: "Run trusted extension hooks after restart", Value: formatBool(cfg.Extensions.Enabled), Choices: []string{"on", "off"}, Restart: true, Advanced: true},
 		{Key: "extensions.directory", Section: "config", Description: "Installed extension directory after restart", Value: cfg.Extensions.Directory, Restart: true, Advanced: true},
 		{Key: "extensions.hook_timeout", Section: "config", Description: "Per-hook timeout after restart", Value: cfg.Extensions.HookTimeout, Restart: true, Advanced: true},
@@ -237,6 +238,12 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Orchestrator.TaskNotifications = strings.ToLower(value)
 	case "orchestrator.max_parallel":
 		cfg.Orchestrator.MaxParallel, err = parseInteger(1)
+	case "orchestrator.workspace_isolation":
+		mode := strings.ToLower(value)
+		if mode != WorkspaceIsolationShared && mode != WorkspaceIsolationGitWorktree {
+			return Setting{}, fmt.Errorf("%s must be %s or %s", key, WorkspaceIsolationShared, WorkspaceIsolationGitWorktree)
+		}
+		cfg.Orchestrator.WorkspaceIsolation = mode
 	case "extensions.enabled":
 		cfg.Extensions.Enabled, err = parseBoolean()
 	case "extensions.directory":

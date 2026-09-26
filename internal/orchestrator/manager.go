@@ -18,7 +18,9 @@ import (
 	"github.com/agent0ai/spynel/internal/agentdocs"
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/execws"
 	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/facts"
 	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/instructions"
@@ -60,6 +62,10 @@ type Lease struct {
 	ClaimAttempt           int                `json:"claim_attempt,omitempty"`
 	ImplementerThread      string             `json:"implementer_thread,omitempty"`
 	TerminalHooksCompleted map[string]bool    `json:"terminal_hooks_completed,omitempty"`
+	LaunchID               string             `json:"launch_id,omitempty"`
+	WorkspaceID            string             `json:"workspace_id,omitempty"`
+	WorkspaceKind          string             `json:"workspace_kind,omitempty"`
+	DocumentID             string             `json:"document_id,omitempty"`
 }
 
 type ScheduledCheckpoint struct {
@@ -86,56 +92,76 @@ type Manager struct {
 	runtimeConfigMu          sync.RWMutex
 	runtimeConfig            config.Config
 
-	mu                          sync.Mutex
-	scanMu                      sync.Mutex
-	inflight                    map[string]bool
-	runtimeJobs                 map[string]int
-	controlCancelled            map[string]int
-	jobs                        pendingGroup
-	capacityMu                  sync.Mutex
-	capacityActive              int
-	capacityLimit               int
-	capacityChanged             chan struct{}
-	writerMu                    sync.Mutex
-	writerActive                int
-	writerChanged               chan struct{}
-	Outbox                      *Outbox
-	ownerID                     string
-	scanNow                     chan struct{}
-	scanTimerMu                 sync.Mutex
-	scanTimer                   *time.Timer
-	scanTimerGeneration         uint64
-	scanNext                    time.Time
-	scanTimerChanged            chan struct{}
-	heartbeatNow                func() time.Time
-	heartbeatTicks              <-chan time.Time
-	heartbeatTimeout            time.Duration
-	heartbeatCommit             sync.Mutex
-	heartbeatTerm               uint64
-	heartbeatProviderActive     atomic.Bool
-	heartbeatProviderMu         sync.Mutex
-	heartbeatProviderDone       chan struct{}
-	heartbeatProviderReleasedAt time.Time
-	heartbeatRunningTerm        atomic.Uint64
-	heartbeatSchedulerActive    atomic.Bool
-	primaryOwned                atomic.Bool
-	orchestratorEnabled         atomic.Bool
-	heartbeatMinutes            atomic.Int64
-	heartbeatConfigChanged      chan struct{}
-	heartbeatManual             chan heartbeatManualRequest
-	heartbeatConfigAcceptedAt   atomic.Int64
-	heartbeatConfigGeneration   atomic.Uint64
-	heartbeatAppliedGeneration  atomic.Uint64
-	harnessPolicy               atomic.Value
-	heartbeatTimerMu            sync.Mutex
-	heartbeatTimer              *time.Timer
-	heartbeatStatusMu           sync.RWMutex
-	heartbeatOwned              bool
-	heartbeatOwnedTerm          uint64
-	heartbeatNext               time.Time
-	cleanupDays                 atomic.Int64
-	cleanupTicks                <-chan time.Time
-	claimDocument               func(source, target, status, attemptField string, now time.Time) (Document, error)
+	mu               sync.Mutex
+	scanMu           sync.Mutex
+	inflight         map[string]bool
+	runtimeJobs      map[string]int
+	controlCancelled map[string]int
+	jobs             pendingGroup
+	capacityMu       sync.Mutex
+	capacityActive   int
+	capacityLimit    int
+	capacityChanged  chan struct{}
+	writerMu         sync.Mutex
+	writerActive     int
+	writerChanged    chan struct{}
+	// writerWaiters holds the live launch owning the workflow writer gate for
+	// each lease so same-process supersession can cancel a launch that will
+	// never settle. leaseLocks serialize launch-fenced lease mutations, and
+	// pipelines tracks in-flight post-terminal pipelines.
+	writerWaiters map[string]*writerWaiter
+	leaseLocks    map[string]*sync.Mutex
+	pipelines     map[string]bool
+	// Facts is the append-only durable evidence journal for every launch.
+	Facts *facts.Journal
+	// WorkspaceBackend owns isolated execution workspaces when the live
+	// configuration selects git-worktree isolation. Tests may inject a fake;
+	// production constructs the local Git backend once.
+	WorkspaceBackend                execws.Backend
+	backendMu                       sync.Mutex
+	cachedBackend                   execws.Backend
+	runOnce                         sync.Once
+	runMu                           sync.RWMutex
+	runCtx                          context.Context
+	Outbox                          *Outbox
+	ownerID                         string
+	scanNow                         chan struct{}
+	scanTimerMu                     sync.Mutex
+	scanTimer                       *time.Timer
+	scanTimerGeneration             uint64
+	scanNext                        time.Time
+	scanTimerChanged                chan struct{}
+	heartbeatNow                    func() time.Time
+	heartbeatTicks                  <-chan time.Time
+	heartbeatTimeout                time.Duration
+	heartbeatCommit                 sync.Mutex
+	heartbeatTerm                   uint64
+	heartbeatProviderActive         atomic.Bool
+	heartbeatProviderMu             sync.Mutex
+	heartbeatProviderDone           chan struct{}
+	heartbeatProviderReleasedAt     time.Time
+	heartbeatRunningTerm            atomic.Uint64
+	heartbeatSchedulerActive        atomic.Bool
+	primaryOwned                    atomic.Bool
+	orchestratorEnabled             atomic.Bool
+	heartbeatMinutes                atomic.Int64
+	heartbeatConfigChanged          chan struct{}
+	heartbeatManual                 chan heartbeatManualRequest
+	heartbeatConfigAcceptedAt       atomic.Int64
+	heartbeatConfigGeneration       atomic.Uint64
+	heartbeatAppliedGeneration      atomic.Uint64
+	harnessPolicy                   atomic.Value
+	heartbeatTimerMu                sync.Mutex
+	heartbeatTimer                  *time.Timer
+	heartbeatStatusMu               sync.RWMutex
+	heartbeatOwned                  bool
+	heartbeatOwnedTerm              uint64
+	heartbeatNext                   time.Time
+	cleanupDays                     atomic.Int64
+	cleanupTicks                    <-chan time.Time
+	claimDocument                   func(source, target, status, attemptField string, now time.Time) (Document, error)
+	controlContinuationBeforeUpdate func()
+	beforeTerminalEffects           func(Lease, string)
 }
 
 // SetPrimaryOwned records whether this manager belongs to the elected
@@ -236,6 +262,8 @@ func New(cfg config.Config, target harness.ExecutionTarget, hooks extensions.Run
 	}
 	manager := &Manager{
 		Config: cfg, runtimeConfig: cfg, Harness: target, Hooks: hooks, inflight: map[string]bool{}, runtimeJobs: map[string]int{}, controlCancelled: map[string]int{}, capacityLimit: parallel,
+		writerWaiters: map[string]*writerWaiter{}, leaseLocks: map[string]*sync.Mutex{}, pipelines: map[string]bool{},
+		Facts:                  facts.Open(cfg.StatePath("runtime", "facts")),
 		Outbox:                 &Outbox{Directory: cfg.StatePath("runtime", "outbox")},
 		ownerID:                fmt.Sprintf("%d-%d-%s", os.Getpid(), time.Now().UTC().UnixNano(), randomSuffix()),
 		scanNow:                make(chan struct{}, 1),
@@ -258,6 +286,7 @@ func (m *Manager) SetNotificationDelivery(deliver func(context.Context, Origin, 
 }
 
 func (m *Manager) Run(ctx context.Context) error {
+	m.InstallLaunchContext(ctx)
 	if observer, ok := m.HarnessRouter.(interface {
 		Readiness() (uint64, <-chan struct{})
 	}); ok {
@@ -540,6 +569,9 @@ func (m *Manager) scanOnce(ctx context.Context) error {
 	if err := collect(m.resumeInterruptedClaims(ctx)); err != nil {
 		return err
 	}
+	if err := collect(m.resumeLaunchPipelines(ctx)); err != nil {
+		return err
+	}
 	if err := collect(m.reconcileTransitions(ctx)); err != nil {
 		return err
 	}
@@ -669,15 +701,28 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 		attempt := numberValue(document.FrontMatter[attemptField]) + 1
 		lease := Lease{
 			ID: key, ClaimID: key, DocumentType: strings.TrimSuffix(route.Name, "s"), Route: route.Name,
-			OwnerID: m.ownerID,
-			File:    target, SourceFile: source, SessionKey: phaseSessionKey(route.Name, documentID, phase, attempt),
+			OwnerID: m.ownerID, DocumentID: documentID,
+			File: target, SourceFile: source, SessionKey: phaseSessionKey(route.Name, documentID, phase, attempt),
 			State: "claiming", Phase: phase, ClaimAttempt: attempt, StartedAt: now, HeartbeatAt: now,
+			WorkspaceKind: execws.WorkspaceKindShared,
 		}
 		if phase == phaseTaskReview {
 			lease.ImplementerThread, _ = document.FrontMatter["implementation_thread"].(string)
 		}
+		// An isolated task implementation or review claim freezes the launch
+		// identity and repository evidence before the document is claimed. A
+		// failed preflight or preparation leaves the task eligible and
+		// unclaimed with the reason surfaced; there is no shared fallback.
+		if m.isolatedClaimForPhase(route.Name, phase) {
+			if !m.prepareIsolatedClaim(ctx, route, phase, documentID, source, document, &lease) {
+				continue
+			}
+		}
 		providerID, held, reserveErr := harness.ReserveExecution(m.harnessForPhase(phase), lease.SessionKey)
 		if reserveErr != nil {
+			if lease.WorkspaceKind == execws.WorkspaceKindGitWorktree {
+				m.abandonIsolatedClaim(ctx, lease, "provider_unavailable", "provider reservation failed before dispatch")
+			}
 			continue
 		}
 		release = held
@@ -703,8 +748,23 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 		}
 		lease.State = "processing"
 		lease.SourceFile = ""
+		if lease.WorkspaceKind == execws.WorkspaceKindGitWorktree {
+			// The document is claimed and the workspace is not yet proven
+			// ready: crash recovery re-prepares this same launch.
+			lease.State = "preparing"
+		}
 		if err := m.saveLease(lease); err != nil {
 			return err
+		}
+		if lease.WorkspaceKind == execws.WorkspaceKindGitWorktree {
+			if !m.prepareIsolatedWorkspace(ctx, lease) {
+				m.abandonIsolatedClaim(ctx, lease, "workspace_prepare_failed", "isolated workspace preparation failed")
+				continue
+			}
+			lease.State = "processing"
+			if err := m.saveLease(lease); err != nil {
+				return err
+			}
 		}
 		if phase == phaseTaskImplementation && m.runtimeSnapshot().Extensions.Enabled {
 			output, hookErr := m.Hooks.Run(ctx, "task.claimed", map[string]any{"route": route.Name, "phase": phase, "file": target, "id": documentID})
@@ -745,17 +805,24 @@ func (m *Manager) startExistingClaim(ctx context.Context, route workflowRoute, p
 	if m.leaseExists(key) || m.hasLeaseForFile(path) || m.isInflight(key) {
 		return nil
 	}
+	now := time.Now().UTC()
+	state := "processing"
+	if recovery {
+		state = "recovering"
+	}
 	field := phaseAttemptField(phase)
 	attempt := numberValue(document.FrontMatter[field])
-	nextAttempt := attempt
+	// Reusing a shared same-attempt session key requires the old session to be
+	// inactive: never steer a replacement launch into an active old one. A
+	// fresh attempt number has no prior session to reuse, but its key must
+	// still be free before a replacement claims it.
+	reuseAttempt := attempt
 	if incrementAttempt || attempt == 0 {
-		nextAttempt++
+		reuseAttempt++
 	}
-	providerID, release, reserveErr := harness.ReserveExecution(m.harnessForPhase(phase), phaseSessionKey(route.Name, id, phase, nextAttempt))
-	if reserveErr != nil {
+	if m.harnessForPhase(phase).IsActive(phaseSessionKey(route.Name, id, phase, reuseAttempt)) {
 		return nil
 	}
-	defer release()
 	if incrementAttempt || attempt == 0 {
 		attempt++
 		document.FrontMatter[field] = attempt
@@ -765,20 +832,26 @@ func (m *Manager) startExistingClaim(ctx context.Context, route workflowRoute, p
 			return err
 		}
 	}
-	now := time.Now().UTC()
-	state := "processing"
-	if recovery {
-		state = "recovering"
-	}
 	lease := Lease{
 		ID: key, ClaimID: key, DocumentType: strings.TrimSuffix(route.Name, "s"), Route: route.Name,
-		OwnerID: m.ownerID,
-		File:    path, SessionKey: phaseSessionKey(route.Name, id, phase, attempt), State: state,
+		OwnerID: m.ownerID, DocumentID: id,
+		File: path, SessionKey: phaseSessionKey(route.Name, id, phase, attempt), State: state,
 		Phase: phase, ClaimAttempt: attempt, StartedAt: now, HeartbeatAt: now,
+		WorkspaceKind: execws.WorkspaceKindShared,
 	}
 	if phase == phaseTaskReview {
 		lease.ImplementerThread, _ = document.FrontMatter["implementation_thread"].(string)
 	}
+	if m.isolatedClaimForPhase(route.Name, phase) {
+		if !m.prepareIsolatedClaim(ctx, route, phase, id, path, document, &lease) {
+			return nil
+		}
+	}
+	providerID, release, reserveErr := harness.ReserveExecution(m.harnessForPhase(phase), lease.SessionKey)
+	if reserveErr != nil {
+		return nil
+	}
+	defer release()
 	if providerID != "" {
 		lease.Provider = providerID
 	}
@@ -875,51 +948,91 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			// waiting for the periodic recovery scan.
 			m.requestScan()
 		}()
+		// Same-process supersession first: a replacement launch must never
+		// deadlock behind a superseded launch's writer slot.
+		m.cancelWriterWaiter(lease.ID)
 		// The writer gate is taken before capacity so a workflow parked on the
-		// shared-checkout writer slot never consumes a max_parallel slot.
+		// shared-checkout writer slot never consumes a max_parallel slot. The
+		// gate now spans dispatch, provider admission, actual provider
+		// execution, the first non-continuing terminal, and the whole
+		// post-terminal pipeline; the slot is released exactly once across
+		// every exit path.
 		if !m.acquireWorkflowWriter(ctx) {
 			return
 		}
-		defer m.releaseWorkflowWriter()
+		slot := newWriterSlot(m.releaseWorkflowWriter)
+		waiter := m.registerWriterWaiter(lease.ID, slot)
 		if !m.acquireCapacity(ctx) {
+			slot.Release()
 			return
 		}
 		defer m.releaseCapacity()
+		if recovery {
+			// Recovery owns a new execution; retire any ended local handle so
+			// its terminal status cannot fence the resumed job. The archive
+			// preserves this workflow dispatch's public number and history.
+			m.finishRuntimeJob(lease.ID)
+		}
+		// Every route-scanned workflow execution owns one durable launch
+		// identity before Send. Shared dispatches always begin a new launch;
+		// isolated dispatches keep the identity fixed at claim time.
+		launch, launchErr := m.beginLaunch(ctx, route, &lease)
+		if launchErr != nil {
+			slot.Release()
+			m.recordError(lease, launchErr)
+			return
+		}
+		waiter.slot = slot
+		if recovery {
+			updated, err := m.updateLeaseValue(lease.ID, launch, func(current *Lease) {
+				current.State = "recovering"
+				current.LastError = ""
+				current.HeartbeatAt = time.Now().UTC()
+				clearBlocked(current)
+			})
+			if err != nil {
+				slot.Release()
+				m.recordError(lease, err)
+				return
+			}
+			lease = updated
+			recoveryAttempt := lease.RecoveryCount + 1
+			note := fmt.Sprintf("Spynel started recovery attempt %d for %s after its durable execution ownership required reconciliation; the recovery agent must record its findings and outcome here.", recoveryAttempt, strings.ReplaceAll(normalizeLeasePhase(route.Name, lease.Phase), "_", " "))
+			if err := updateDocumentProgress(lease.File, time.Now().UTC(), note); err != nil {
+				slot.Release()
+				m.recordError(lease, fmt.Errorf("record recovery progress: %w", err))
+				return
+			}
+		}
 		promptPath := route.Prompt
 		if recovery {
 			promptPath = route.RecoveryPrompt
 		} else if lease.Phase == phaseTaskReview || lease.Phase == phaseGoalReview || lease.Phase == "review" {
 			promptPath = route.ReviewPrompt
 		}
-		if recovery {
-			// Recovery owns a new execution; retire any ended local handle so
-			// its terminal status cannot fence the resumed job. The archive
-			// preserves this workflow dispatch's public number and history.
-			m.finishRuntimeJob(lease.ID)
-			lease.State = "recovering"
-			lease.LastError = ""
-			lease.HeartbeatAt = time.Now().UTC()
-			clearBlocked(&lease)
-			if err := m.saveLease(lease); err != nil {
-				m.recordError(lease, err)
-				return
-			}
-			recoveryAttempt := lease.RecoveryCount + 1
-			note := fmt.Sprintf("Spynel started recovery attempt %d for %s after its durable execution ownership required reconciliation; the recovery agent must record its findings and outcome here.", recoveryAttempt, strings.ReplaceAll(normalizeLeasePhase(route.Name, lease.Phase), "_", " "))
-			if err := updateDocumentProgress(lease.File, time.Now().UTC(), note); err != nil {
-				m.recordError(lease, fmt.Errorf("record recovery progress: %w", err))
+		if lease.WorkspaceKind == execws.WorkspaceKindGitWorktree {
+			// The isolated workspace is prepared and bound idempotently; a
+			// dispatch that resumes an unadmitted crash uses the same launch.
+			if !m.prepareIsolatedWorkspace(ctx, lease) {
+				slot.Release()
+				m.recordError(lease, errors.New("isolated workspace is unavailable for launch "+launch))
 				return
 			}
 		}
 		prompt, err := m.renderPrompt(route, lease, promptPath)
 		if err != nil {
+			slot.Release()
 			m.recordError(lease, err)
 			return
+		}
+		if lease.WorkspaceKind == execws.WorkspaceKindGitWorktree {
+			prompt = injectIsolationPrompt(lease.Phase, prompt)
 		}
 		harnessSettings := m.harnessSettings()
 		prompt = config.PrependAgentPrefix(m.agentPrefix(lease.Phase, harnessSettings), prompt)
 		firstAssignedAt, providerIterations, err := ReserveProviderTurn(lease.File, time.Now().UTC())
 		if err != nil {
+			slot.Release()
 			m.recordError(lease, err)
 			return
 		}
@@ -933,6 +1046,7 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			}
 			jobID, err = m.JobStarted(lease, filepath.Base(lease.File), firstAssignedAt, providerIterations, implementationAttempts)
 			if err != nil {
+				slot.Release()
 				m.recordError(lease, err)
 				return
 			}
@@ -954,7 +1068,9 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			}
 		}
 		// Admission and asynchronous events must not overwrite each other's
-		// lease state (especially a terminal event racing Send's return).
+		// lease state (especially a terminal event racing Send's return), and
+		// every durable mutation is fenced by this dispatch's launch identity:
+		// a stale launch can never mutate current durable workflow state.
 		var lifecycleMu sync.Mutex
 		emit := func(event core.Event) {
 			lifecycleMu.Lock()
@@ -966,9 +1082,11 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 				// live-primary scan that reconciled this execution. This emit
 				// intentionally performs no durable mutation for the retired
 				// job, so a non-continuing terminal event may release the
-				// settlement gate before returning instead of leaking it.
+				// settlement gate and writer slot before returning instead of
+				// leaking either.
 				if settled {
 					release()
+					slot.Release()
 				}
 				return
 			}
@@ -979,30 +1097,31 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			// the durable lease still existing. A fast agent can move its task,
 			// then a concurrent recovery scan can remove the obsolete lease
 			// before the provider emits its final event.
-			current, err := m.loadLease(lease.ID)
+			current, err := m.updateLeaseValue(lease.ID, launch, func(current *Lease) {
+				current.HeartbeatAt = time.Now().UTC()
+				if event.ThreadID != "" {
+					current.ThreadID = event.ThreadID
+				}
+				if event.Kind == core.EventError {
+					current.LastError = event.Text
+				}
+				if terminal {
+					current.State = "awaiting_transition"
+				} else if current.State == "recovering" && event.Execution != nil && event.Execution.State == "running" {
+					current.State = "processing"
+				}
+			})
 			if err != nil {
+				// The lease is gone or a replacement launch owns it. Settle
+				// process-local bookkeeping without any durable mutation.
 				if terminal {
 					finish()
 				}
 				if settled {
 					release()
+					slot.Release()
 				}
 				return
-			}
-			current.HeartbeatAt = time.Now().UTC()
-			if event.ThreadID != "" {
-				current.ThreadID = event.ThreadID
-			}
-			if event.Kind == core.EventError {
-				current.LastError = event.Text
-			}
-			if terminal {
-				current.State = "awaiting_transition"
-			} else if current.State == "recovering" && event.Execution != nil && event.Execution.State == "running" {
-				current.State = "processing"
-			}
-			if err := m.saveLease(current); err != nil {
-				m.log("save lease event state: " + err.Error())
 			}
 			if jobID > 0 && m.JobUpdated != nil {
 				m.JobUpdated(jobID, current)
@@ -1016,6 +1135,7 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			// and job bookkeeping have completed.
 			if settled {
 				release()
+				m.settleLaunch(route, current, launch, slot, event)
 			}
 		}
 		if gate != nil {
@@ -1033,27 +1153,30 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			}
 			finish()
 			release()
+			slot.Release()
 			m.recordError(lease, err)
+			m.recordLaunchFailure(lease, launch, "admission", "provider_error", err)
 			return
 		}
-		current, loadErr := m.loadLease(lease.ID)
-		if os.IsNotExist(loadErr) {
-			return
-		}
-		if loadErr == nil {
-			lease = current
-		}
-		lease.ThreadID = threadID
-		lease.HeartbeatAt = time.Now().UTC()
-		if recovery {
-			lease.RecoveryCount++
-			if lease.State == "recovering" {
-				lease.State = "processing"
+		admitted, err := m.updateLeaseValue(lease.ID, launch, func(current *Lease) {
+			current.ThreadID = threadID
+			current.HeartbeatAt = time.Now().UTC()
+			if recovery {
+				current.RecoveryCount++
+				if current.State == "recovering" {
+					current.State = "processing"
+				}
 			}
-		}
-		if err := m.saveLease(lease); err != nil {
+		})
+		if err != nil {
+			if os.IsNotExist(err) {
+				return
+			}
 			m.log("save lease dispatch state: " + err.Error())
+			admitted = lease
 		}
+		lease = admitted
+		m.recordProviderAdmitted(lease, launch)
 		if jobID > 0 && m.JobUpdated != nil {
 			m.JobUpdated(jobID, lease)
 		}
@@ -1133,6 +1256,7 @@ func (m *Manager) reconcileTransitionsCount(ctx context.Context) (int, error) {
 			}
 			_ = os.Remove(m.leasePath(lease.ID))
 			m.finishRuntimeJob(lease.ID)
+			m.releaseIsolatedSession(lease)
 			reconciled++
 			continue
 		}
@@ -1144,12 +1268,18 @@ func (m *Manager) reconcileTransitionsCount(ctx context.Context) (int, error) {
 		case "goals":
 			status, path, err = m.reconcileGoalTransition(ctx, route, lease, phase, status, path)
 		}
+		if errors.Is(err, errTransitionDeferred) {
+			// An isolated launch's transition waits for its own pipeline or
+			// replacement; the lease and document stay untouched.
+			continue
+		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("lease %s: reconcile %s candidate %s: %w", lease.ID, candidateStatus, candidatePath, err))
 			continue
 		}
 		_ = os.Remove(m.leasePath(lease.ID))
 		m.finishRuntimeJob(lease.ID)
+		m.releaseIsolatedSession(lease)
 		reconciled++
 		if route.Name == "goals" && phase == phaseGoalReview && status == "planning" {
 			if err := m.startExistingClaim(ctx, route, path, phaseGoalPlanning, false, true); err != nil {
@@ -1178,6 +1308,9 @@ func normalizeLeasePhase(routeName, phase string) string {
 }
 
 func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRoute, lease Lease, phase, status, path string) (string, string, error) {
+	if lease.WorkspaceKind == execws.WorkspaceKindGitWorktree {
+		return m.reconcileIsolatedTaskTransition(ctx, route, lease, phase, status, path)
+	}
 	base := filepath.Dir(m.Config.Resolve(route.Source))
 	name := filepath.Base(path)
 	if phase == phaseTaskImplementation {
@@ -1332,6 +1465,9 @@ func (m *Manager) redirectTransition(path, target, status, note string) (string,
 }
 
 func (m *Manager) completeTransition(ctx context.Context, route workflowRoute, lease Lease, status, path string) error {
+	if m.beforeTerminalEffects != nil {
+		m.beforeTerminalEffects(lease, status)
+	}
 	document, err := ReadDocument(path)
 	if err != nil {
 		return err
@@ -1848,6 +1984,16 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 		if (lease.Blocked == nil && !foreignOwner && now.Sub(lease.HeartbeatAt) < route.StaleAfter) || m.isInflight(lease.ID) || m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) {
 			continue
 		}
+		// A stale isolated launch whose provider was admitted is superseded
+		// by a replacement launch: new LaunchID, new SessionKey, new
+		// WorkspaceID, and an empty initial thread. An unadmitted crash keeps
+		// the same launch and resumes through the dispatch ensure path.
+		if lease.WorkspaceKind == execws.WorkspaceKindGitWorktree && lease.LaunchID != "" &&
+			m.launchWasAdmitted(lease.Route, documentIDForLease(lease), lease.LaunchID) {
+			if !m.replaceIsolatedLaunch(ctx, route, &lease) {
+				continue
+			}
+		}
 		oldProvider := lease.Provider
 		providerID, held, moved, reserveErr := m.reserveLease(&lease)
 		if reserveErr != nil {
@@ -2004,7 +2150,7 @@ func (m *Manager) WaitForIdle(ctx context.Context) error {
 		}
 		busy := false
 		for _, lease := range leases {
-			if m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) || m.isInflight(lease.ID) {
+			if m.harnessForPhase(lease.Phase).IsActive(lease.SessionKey) || m.isInflight(lease.ID) || m.pipelineInflight(lease.ID) {
 				busy = true
 				break
 			}
@@ -2220,17 +2366,25 @@ func (m *Manager) PrepareControlContinuation(expected Lease, expectedDocumentID 
 	if !m.ControlStillValid(expected, expectedDocumentID) || !m.harnessForPhase(expected.Phase).IsActive(expected.SessionKey) {
 		return false
 	}
-	current, err := m.loadLease(expected.ID)
-	if err != nil {
-		return false
+	if m.controlContinuationBeforeUpdate != nil {
+		m.controlContinuationBeforeUpdate()
 	}
-	if current.State != "awaiting_transition" && current.State != "processing" && current.State != "recovering" {
-		return false
-	}
-	current.State = "processing"
-	current.LastError = ""
-	if err := m.saveLease(current); err != nil {
-		m.log("save control continuation lease: " + err.Error())
+	valid := false
+	current, err := m.updateLeaseValue(expected.ID, expected.LaunchID, func(current *Lease) {
+		if current.OwnerID != expected.OwnerID || current.SessionKey != expected.SessionKey || current.File != expected.File || current.Phase != expected.Phase {
+			return
+		}
+		if current.State != "awaiting_transition" && current.State != "processing" && current.State != "recovering" {
+			return
+		}
+		current.State = "processing"
+		current.LastError = ""
+		valid = true
+	})
+	if err != nil || !valid {
+		if err != nil && !errors.Is(err, ErrStaleLaunch) {
+			m.log("save control continuation lease: " + err.Error())
+		}
 		return false
 	}
 	if jobID := m.runtimeJob(expected.ID); jobID > 0 && m.JobUpdated != nil {
@@ -2265,6 +2419,11 @@ func (m *Manager) ControlStillValid(expected Lease, expectedDocumentID string) b
 	}
 	current, err := m.loadLease(expected.ID)
 	if err != nil || current.OwnerID != expected.OwnerID || current.SessionKey != expected.SessionKey || current.File != expected.File || current.Phase != expected.Phase {
+		return false
+	}
+	// Shared launches can share one session key across supersessions: only
+	// the durable launch identity fences a control continuation.
+	if current.LaunchID != expected.LaunchID {
 		return false
 	}
 	if current.State != "awaiting_transition" && current.State != "processing" && current.State != "recovering" {
@@ -2397,6 +2556,26 @@ func (m *Manager) finishRuntimeJob(leaseID string) {
 	if jobID > 0 && m.JobFinished != nil {
 		m.JobFinished(jobID)
 	}
+}
+
+// workspaceBackend resolves the isolated-workspace backend, constructing the
+// local Git backend once per process. Tests may inject a fake.
+func (m *Manager) workspaceBackend() execws.Backend {
+	if m.WorkspaceBackend != nil {
+		return m.WorkspaceBackend
+	}
+	m.backendMu.Lock()
+	defer m.backendMu.Unlock()
+	if m.cachedBackend != nil {
+		return m.cachedBackend
+	}
+	backend, err := execws.NewLocalGit(m.runtimeSnapshot().Root)
+	if err != nil {
+		m.log("isolated workspace backend: " + err.Error())
+		return nil
+	}
+	m.cachedBackend = backend
+	return backend
 }
 
 func (m *Manager) log(message string) {

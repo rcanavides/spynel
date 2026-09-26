@@ -368,9 +368,9 @@ func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selec
 	params := map[string]any{
 		"threadId":       threadID,
 		"input":          []map[string]any{{"type": "text", "text": prompt}},
-		"cwd":            c.config.Cwd,
+		"cwd":            c.sessionCwd(key),
 		"approvalPolicy": c.config.ApprovalPolicy,
-		"sandboxPolicy":  c.sandboxPolicy(),
+		"sandboxPolicy":  c.sandboxPolicyFor(key),
 	}
 	if selection.Model != "" {
 		params["model"] = selection.Model
@@ -508,7 +508,7 @@ func (c *Codex) ensureThread(ctx context.Context, key, model string) (string, er
 		}
 	}
 	params := map[string]any{
-		"cwd":            c.config.Cwd,
+		"cwd":            c.sessionCwd(key),
 		"approvalPolicy": c.config.ApprovalPolicy,
 		"sandbox":        c.threadSandbox(),
 		"serviceName":    "spynel",
@@ -539,7 +539,24 @@ func (c *Codex) ensureThread(ctx context.Context, key, model string) (string, er
 	return response.Thread.ID, err
 }
 
+// sessionCwd resolves the execution CWD for one session: a bound isolated
+// workspace directory when present, otherwise the configured workspace root.
+// Session persistence is never derived from this value.
+func (c *Codex) sessionCwd(key string) string {
+	if workspace, ok := SessionWorkspaceFor(key); ok && workspace.Dir != "" {
+		return workspace.Dir
+	}
+	return c.config.Cwd
+}
+
 func (c *Codex) sandboxPolicy() map[string]any {
+	return c.sandboxPolicyFor("")
+}
+
+// sandboxPolicyFor applies the session-bound execution CWD and any additional
+// writable roots to the turn sandbox. Isolated workspaces keep the configured
+// sandbox mode and gain their own workspace directory as writable.
+func (c *Codex) sandboxPolicyFor(key string) map[string]any {
 	sandbox := c.threadSandbox()
 	typeName := "workspaceWrite"
 	if sandbox == "read-only" {
@@ -549,7 +566,12 @@ func (c *Codex) sandboxPolicy() map[string]any {
 	}
 	result := map[string]any{"type": typeName}
 	if sandbox == "workspace-write" {
-		result["writableRoots"] = []string{c.config.Cwd}
+		workspace, bound := SessionWorkspaceFor(key)
+		roots := []string{c.config.Cwd}
+		if bound {
+			roots = append(append([]string{workspace.Dir}, workspace.WritableRoots...), c.config.Cwd)
+		}
+		result["writableRoots"] = roots
 		result["networkAccess"] = c.config.Network
 	}
 	return result

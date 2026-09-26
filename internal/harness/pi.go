@@ -486,7 +486,7 @@ func (p *Pi) ensureProcess(ctx context.Context, key, model, effort string) (*piP
 	if process := p.processes[key]; process != nil {
 		process.mu.Lock()
 		active := process.active != nil
-		policyMatches := process.session.Policy == p.sessionPolicyLocked(model, effort)
+		policyMatches := process.session.Policy == p.sessionPolicyForKeyLocked(key, model, effort)
 		process.mu.Unlock()
 		if active || policyMatches {
 			p.mu.Unlock()
@@ -498,7 +498,7 @@ func (p *Pi) ensureProcess(ctx context.Context, key, model, effort string) (*piP
 		p.mu.Lock()
 	}
 	session := p.sessions[key]
-	if session.Policy != p.sessionPolicyLocked(model, effort) {
+	if session.Policy != p.sessionPolicyForKeyLocked(key, model, effort) {
 		session = piSession{}
 		delete(p.sessions, key)
 	}
@@ -537,15 +537,24 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 	if closed || baseContext == nil {
 		return nil, errors.New("Pi harness is not running")
 	}
+	// A session-bound isolated workspace changes only the execution directory
+	// of this RPC process. Pi session storage derives from the configured
+	// SessionsFile location and never moves with the binding.
+	sessionDir := ""
+	if !ephemeral {
+		sessionDir = filepath.Join(filepath.Dir(cfg.SessionsFile), "pi-sessions")
+		if cfg.SessionsFile == "" {
+			sessionDir = filepath.Join(cfg.Cwd, ".spynel", "runtime", "pi-sessions")
+		}
+	}
+	if workspace, ok := SessionWorkspaceFor(key); ok && workspace.Dir != "" {
+		cfg.Cwd = workspace.Dir
+	}
 	processContext, cancel := context.WithCancel(baseContext)
 	args := []string{"--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes"}
 	if ephemeral {
 		args = append(args, "--no-session")
 	} else {
-		sessionDir := filepath.Join(filepath.Dir(cfg.SessionsFile), "pi-sessions")
-		if cfg.SessionsFile == "" {
-			sessionDir = filepath.Join(cfg.Cwd, ".spynel", "runtime", "pi-sessions")
-		}
 		if err := os.MkdirAll(sessionDir, 0o700); err != nil {
 			cancel()
 			return nil, err
@@ -999,9 +1008,16 @@ func (p *Pi) lockForKey(key string) *sync.Mutex {
 }
 
 func (p *Pi) sessionPolicyLocked(model, effort string) string {
+	return p.sessionPolicyForKeyLocked("", model, effort)
+}
+
+func (p *Pi) sessionPolicyForKeyLocked(key, model, effort string) string {
 	cfg := p.config
 	cfg.Model = model
 	cfg.Effort = effort
+	if workspace, ok := SessionWorkspaceFor(key); ok && workspace.Dir != "" {
+		cfg.Cwd = workspace.Dir
+	}
 	return piSessionPolicy(cfg)
 }
 

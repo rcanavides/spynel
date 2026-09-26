@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,9 +13,139 @@ import (
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/execws"
+	"github.com/agent0ai/spynel/internal/facts"
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
+
+func TestCleanupUsesPositiveConfiguredWorkspaceRetentionDays(t *testing.T) {
+	root := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		command := exec.Command("git", args...)
+		command.Dir = root
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, output)
+		}
+		return strings.TrimSpace(string(output))
+	}
+	runGit("init", "-q", "--initial-branch=main", ".")
+	runGit("config", "user.email", "cleanup@example.com")
+	runGit("config", "user.name", "Cleanup")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("cleanup\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "README.md")
+	runGit("commit", "-qm", "base")
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workspace.CleanupRetentionDays != 30 {
+		t.Fatalf("configured retention = %d, want 30", cfg.Workspace.CleanupRetentionDays)
+	}
+	service := New(cfg, newServiceHarness())
+	backend, err := execws.NewLocalGit(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Orchestrator.WorkspaceBackend = backend
+	base := runGit("rev-parse", "HEAD")
+	now := time.Now().UTC()
+	type cleanupWorkspace struct {
+		id        string
+		launch    string
+		doc       string
+		class     string
+		at        time.Time
+		removable bool
+	}
+	workspaces := []cleanupWorkspace{}
+	for _, class := range []string{"failed", "rejected", "superseded", "reviewer"} {
+		workspaces = append(workspaces,
+			cleanupWorkspace{id: execws.NewWorkspaceID(), launch: "ln-fresh-" + class, doc: "fresh-" + class, class: class, at: now.Add(-24 * time.Hour)},
+			cleanupWorkspace{id: execws.NewWorkspaceID(), launch: "ln-old-" + class, doc: "old-" + class, class: class, at: now.Add(-31 * 24 * time.Hour), removable: true},
+		)
+	}
+	wantRemoved := map[string]bool{}
+	wantRetained := map[string]bool{}
+	for _, item := range workspaces {
+		if err := backend.Prepare(context.Background(), execws.Spec{ID: item.id, StartSHA: base}); err != nil {
+			t.Fatal(err)
+		}
+		doc := facts.Doc{Kind: facts.DocKindTask, ID: item.doc}
+		phase := "task_implementation"
+		if item.class == "reviewer" {
+			phase = "task_review"
+		}
+		if _, err := service.Orchestrator.Facts.Append(facts.Fact{
+			Kind: facts.KindLaunchCreated, Key: item.launch + ":launch_created", At: item.at,
+			Doc: doc, Launch: item.launch, Phase: phase, WorkspaceID: item.id,
+			WorkspaceKind: execws.WorkspaceKindGitWorktree, BaseSHA: base, TargetRef: "refs/heads/main", TargetOld: base,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var classFact facts.Fact
+		switch item.class {
+		case "failed":
+			classFact = facts.Fact{Kind: facts.KindLaunchFailed, Key: item.launch + ":launch_failed", Stage: "checks", ErrorClass: "checks_failed"}
+		case "rejected":
+			classFact = facts.Fact{Kind: facts.KindIntegrationRejected, Key: item.launch + ":integration", Outcome: "target_advanced"}
+		case "superseded":
+			classFact = facts.Fact{Kind: facts.KindLaunchCreated, Key: item.launch + ":replacement", Launch: item.launch + "-replacement", WorkspaceID: execws.NewWorkspaceID(), Supersedes: item.launch}
+		}
+		if classFact.Kind != "" {
+			classFact.At = item.at
+			classFact.Doc = doc
+			if classFact.Launch == "" {
+				classFact.Launch = item.launch
+			}
+			classFact.Phase = phase
+			classFact.WorkspaceKind = execws.WorkspaceKindGitWorktree
+			if classFact.WorkspaceID == "" {
+				classFact.WorkspaceID = item.id
+			}
+			if _, err := service.Orchestrator.Facts.Append(classFact); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if item.removable {
+			wantRemoved[item.id] = true
+		} else {
+			wantRetained[item.id] = true
+		}
+	}
+
+	result, err := service.runCleanup(cfg.Workspace.CleanupRetentionDays, "", "", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.RemovedWorkspaces) != len(wantRemoved) {
+		t.Fatalf("removed workspaces = %v, want %v", result.RemovedWorkspaces, wantRemoved)
+	}
+	for _, workspaceID := range result.RemovedWorkspaces {
+		if !wantRemoved[workspaceID] {
+			t.Fatalf("removed fresh workspace %s; want old set %v", workspaceID, wantRemoved)
+		}
+	}
+	refs, err := backend.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != len(wantRetained) {
+		t.Fatalf("retained workspaces = %v, want %v", refs, wantRetained)
+	}
+	for _, ref := range refs {
+		if !wantRetained[ref.ID] {
+			t.Fatalf("retained expired workspace %s; want fresh set %v", ref.ID, wantRetained)
+		}
+	}
+}
 
 func TestCleanupUsesLastUpdateStrictCutoffAndArchivesOnlyTerminalTasks(t *testing.T) {
 	root := t.TempDir()
